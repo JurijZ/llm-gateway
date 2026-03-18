@@ -13,7 +13,7 @@ uv run fastapi dev main.py
 
 Swagger is on http://127.0.0.1:8000/docs
 
-Most basic request body:
+Request body example:
 ```json
 {
   "messages": [
@@ -22,11 +22,12 @@ Most basic request body:
       "content": "How many planets in the solar system?"
     }
   ],
+  "model_preference": "gpt-5.2",
   "stream": true
 }
 ```
 
-If a value other than "openai" or "anthropic" is provided, the system will fall back to the default provider according to the active routing strategy.
+If a model_preference is not provided, the system will fall back to the default according to the active routing strategy.
 ```json
 {
   "messages": [
@@ -35,7 +36,6 @@ If a value other than "openai" or "anthropic" is provided, the system will fall 
       "content": "How many planets in the solar system?"
     }
   ],
-  "model_preference": "string",
   "stream": true
 }
 ```
