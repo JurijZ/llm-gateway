@@ -1,9 +1,4 @@
 
-## Start coding agents
-```bash
-npx @google/gemini-cli
-```
-
 ### Start FastAPI server
 ```bash
 cd app/
