@@ -9,9 +9,8 @@ from typing import List
 
 router = APIRouter(prefix="/v1")
 
-# In-memory router manager setup
-# In a real app, this could be a global dependency or a singleton
-def get_router_manager():
+# In-memory provider discovery
+def get_providers():
     providers = []
     if settings.OPENAI_API_KEY:
         providers.append(OpenAIProvider())
@@ -24,10 +23,13 @@ def get_router_manager():
         # We can add them anyway, they'll just fail later if keys are missing
         providers = [OpenAIProvider(), AnthropicProvider()]
         
-    return RouterManager(providers)
+    return providers
 
 @router.post("/chat")
-async def chat_endpoint(request: ChatRequest, manager: RouterManager = Depends(get_router_manager)):
+async def chat_endpoint(request: ChatRequest, providers: List = Depends(get_providers)):
+    # Initialize RouterManager with the strategy from the request (or default from manager)
+    manager = RouterManager(providers, strategy_type=request.routing_strategy)
+    
     # Standardize messages to list of dicts for providers
     messages_dict = [{"role": m.role, "content": m.content} for m in request.messages]
     

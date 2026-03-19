@@ -4,18 +4,23 @@ This project is a FastAPI-based service designed to act as a unified gateway for
 
 ## Project Overview
 
-- **Purpose:** Provide a single `POST /chat` endpoint that routes requests to various LLMs with streaming support.
+- **Purpose:** Provide a unified gateway for multiple LLMs via a set of versioned API endpoints.
+- **API Endpoints:**
+  - `POST /v1/chat`: Stream chat completions with dynamic provider/model selection and fallback. Supports `model_preference` and `routing_strategy`.
+  - `GET /v1/models`: Returns a mapping of supported models to providers and their default models.
+  - `GET /v1/strategies`: Lists available routing strategies (e.g., hardcoded, latency, cost_latency).
 - **Core Technologies:** 
   - Python 3.13+
   - FastAPI
   - Pydantic
   - `uv` for package management
   - LLM SDKs (OpenAI, Anthropic)
-- **Key Features (Planned):**
+  - Always use OpenAI Responses API. Never use OpenAI Completions API.
+- **Key Features:**
   - Streaming chunk-by-chunk responses.
-  - Routing strategies: Hardcoded, Load Balancing (least in-flight requests), and Latency-based selection.
-  - Reliability: Timeouts, retries, and fallback strategies.
-  - Observability: Request tracing (Nice-to-have).
+  - Intelligent Routing: Hardcoded, Least In-Flight, Latency-based, and Cost+Latency Tradeoff strategies.
+  - Reliability: Timeouts, retries, and automatic provider fallback.
+  - Observability: Request tracing (Planned).
 
 ## Architecture
 
