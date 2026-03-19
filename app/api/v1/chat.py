@@ -34,7 +34,9 @@ async def chat_endpoint(request: ChatRequest, providers: List = Depends(get_prov
     messages_dict = [{"role": m.role, "content": m.content} for m in request.messages]
     
     async def stream_generator():
-        async for chunk in manager.stream_with_fallback(messages_dict, request.model_preference):
+        async for chunk in manager.stream_with_fallback(
+            messages_dict, request.model_preference, request.fallback_models
+        ):
             yield chunk
 
     return StreamingResponse(stream_generator(), media_type="text/plain")

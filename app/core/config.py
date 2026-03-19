@@ -19,7 +19,12 @@ class Settings(BaseSettings):
     DEFAULT_STRATEGY: str = "hardcoded"  # hardcoded, load_balance, latency
     
     # Timeout settings (seconds)
-    REQUEST_TIMEOUT: int = 30
+    # TTFC_TIMEOUT: max wait for the *first* chunk — exceeding this triggers fallback.
+    # CHUNK_TIMEOUT: max idle time *between* subsequent chunks — exceeding this means
+    #                the stream stalled mid-response; no fallback is possible because
+    #                bytes have already been sent to the client.
+    TTFC_TIMEOUT: int = 10
+    CHUNK_TIMEOUT: int = 30
     
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
