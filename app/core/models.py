@@ -5,8 +5,8 @@ MODEL_MAPPING: Dict[str, Tuple[str, str]] = {
     "gpt-4o": ("openai", "gpt-4o"),
     "gpt-5.2": ("openai", "gpt-5.2"),
     "gpt-3.5-turbo": ("openai", "gpt-3.5-turbo"),
-    "claude-3-5-sonnet": ("anthropic", "claude-3-5-sonnet-20240620"),
-    "claude-3-opus": ("anthropic", "claude-3-opus-20240229"),
+    "claude-3-5-sonnet": ("anthropic", "claude-3-5-sonnet"),
+    "claude-opus-4-6-1": ("anthropic", "claude-opus-4-6-1"),
     "claude-3-haiku": ("anthropic", "claude-3-haiku-20240307"),
 }
 

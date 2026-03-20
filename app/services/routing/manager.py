@@ -219,6 +219,7 @@ class RouterManager:
             committed = False  # True once the first chunk is yielded upstream
 
             try:
+                print("Provider:", provider_name, "Model:", target_model)
                 async for chunk in self._stream_with_timeouts(provider, messages, target_model):
                     if not committed:
                         latency = asyncio.get_running_loop().time() - start_time
@@ -242,6 +243,7 @@ class RouterManager:
                     raise
 
                 # Not yet committed — try next candidate.
+                logger.info(f"Trying next candidate for {provider_name}")
                 continue
 
             finally:

@@ -14,8 +14,11 @@ class AnthropicProvider(LLMProvider):
         # Anthropic: [{"role": "user", "content": "..."}]
         # But Anthropic doesn't support "system" message in the list.
         # It's usually a separate parameter.
-        system_msg = next((m["content"] for m in messages if m["role"] == "system"), None)
+        system_msg = "You are a helpful assistant" #next((m["content"] for m in messages if m["role"] == "system"), None)
         chat_messages = [m for m in messages if m["role"] != "system"]
+
+        print(system_msg)
+        print(chat_messages)
 
         async with self.client.messages.stream(
             model=model or self.default_model,

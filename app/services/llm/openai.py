@@ -9,6 +9,7 @@ class OpenAIProvider(LLMProvider):
 
         # print("Default model set to:", default_model)
 
+
         self.client = openai.AsyncOpenAI(api_key=api_key or settings.OPENAI_API_KEY)
         self.default_model = default_model
 
@@ -19,10 +20,12 @@ class OpenAIProvider(LLMProvider):
             model=model or self.default_model,
             input=messages,
             stream=True,
+            timeout=1,  # Total timeout for the entire response
         )
         async for event in stream:
             if event.type == "response.output_text.delta":
                 #print(event.delta)
+                # raise StopIteration(event.delta)  # Stop after the first chunk (TTFC)
                 yield event.delta
 
     def get_provider_name(self) -> str:
