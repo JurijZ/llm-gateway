@@ -20,7 +20,6 @@ class OpenAIProvider(LLMProvider):
             model=model or self.default_model,
             input=messages,
             stream=True,
-            timeout=1,  # Total timeout for the entire response
         )
         async for event in stream:
             if event.type == "response.output_text.delta":
