@@ -28,6 +28,8 @@ The project aims for a clean FastAPI structure following best practices. It will
 - A routing layer to handle strategy selection.
 - Provider abstractions for OpenAI and Anthropic.
 - Middlewares for tracing and error handling.
+- **Stateful Singleton Strategies:** Routing strategies (like Latency-based and Cost+Latency) are cached to appropriately preserve routing metrics and context across API requests.
+- **Provider Caching:** Core LLM Provider HTTP connection clients are appropriately cached to avoid process overhead.
 
 ## Building and Running
 
