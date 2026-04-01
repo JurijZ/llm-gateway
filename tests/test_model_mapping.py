@@ -37,7 +37,7 @@ async def test_get_model_info():
 async def test_router_manager_uses_mapped_model():
     openai_mock = MockProvider("openai")
     anthropic_mock = MockProvider("anthropic")
-    manager = RouterManager([openai_mock, anthropic_mock], strategy_type="hardcoded")
+    manager = RouterManager([openai_mock, anthropic_mock])
 
     # Request gpt-4o
     messages = [{"role": "user", "content": "hi"}]
@@ -57,7 +57,7 @@ async def test_router_manager_fallback_behavior():
     # If a model preference is provided but that provider is NOT available
     # It should fallback to available providers and NOT pass the model ID (which would be invalid)
     anthropic_mock = MockProvider("anthropic")
-    manager = RouterManager([anthropic_mock], strategy_type="hardcoded")
+    manager = RouterManager([anthropic_mock])
     
     messages = [{"role": "user", "content": "hi"}]
     # Preference is openai model, but only anthropic is available

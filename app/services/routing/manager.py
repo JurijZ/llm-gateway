@@ -25,31 +25,29 @@ def get_strategy(strategy_name: str) -> RoutingStrategy:
 
 
 class RouterManager:
-    def __init__(self, providers: List[LLMProvider], strategy_type: str = None):
+    def __init__(self, providers: List[LLMProvider]):
         self.providers = providers
-        self.strategy: RoutingStrategy = get_strategy(
-            strategy_type or settings.DEFAULT_STRATEGY
-        )
 
     # ------------------------------------------------------------------
     # Provider / candidate selection
     # ------------------------------------------------------------------
 
-    def select_provider(self, preference: Optional[str] = None) -> LLMProvider:
+    def select_provider(self, active_strategy: RoutingStrategy, preference: Optional[str] = None) -> LLMProvider:
         """
         Public helper: returns the single provider the active strategy selects.
         For HardcodedStrategy the model preference is used to resolve a provider;
         for all other strategies the preference is ignored (strategy overrides).
         """
-        if isinstance(self.strategy, HardcodedStrategy) and preference:
+        if isinstance(active_strategy, HardcodedStrategy) and preference:
             resolved_provider_name, _ = get_model_info(preference)
-            return self.strategy.select_provider(
+            return active_strategy.select_provider(
                 self.providers, resolved_provider_name or preference
             )
-        return self.strategy.select_provider(self.providers)
+        return active_strategy.select_provider(self.providers)
 
     def _build_candidates(
         self,
+        active_strategy: RoutingStrategy,
         preference: Optional[str],
         fallback_models: Optional[List[str]],
     ) -> List[Tuple[LLMProvider, Optional[str]]]:
@@ -69,12 +67,12 @@ class RouterManager:
         )
 
         # 1. Primary: strategy picks the provider.
-        if isinstance(self.strategy, HardcodedStrategy):
-            primary = self.strategy.select_provider(
+        if isinstance(active_strategy, HardcodedStrategy):
+            primary = active_strategy.select_provider(
                 self.providers, resolved_provider_name or preference
             )
         else:
-            primary = self.strategy.select_provider(self.providers)
+            primary = active_strategy.select_provider(self.providers)
 
         primary_model = (
             resolved_model_id
@@ -165,19 +163,19 @@ class RouterManager:
     # Metric helpers
     # ------------------------------------------------------------------
 
-    def _record_latency(self, provider_name: str, latency: float):
-        if isinstance(self.strategy, LatencyBasedStrategy):
-            self.strategy.update_latency(provider_name, latency)
-        elif isinstance(self.strategy, CostLatencyTradeoffStrategy):
-            self.strategy.update_metrics(provider_name, latency=latency)
+    def _record_latency(self, active_strategy: RoutingStrategy, provider_name: str, latency: float):
+        if isinstance(active_strategy, LatencyBasedStrategy):
+            active_strategy.update_latency(provider_name, latency)
+        elif isinstance(active_strategy, CostLatencyTradeoffStrategy):
+            active_strategy.update_metrics(provider_name, latency=latency)
 
-    def _record_success(self, provider_name: str):
-        if isinstance(self.strategy, CostLatencyTradeoffStrategy):
-            self.strategy.update_metrics(provider_name, is_error=False)
+    def _record_success(self, active_strategy: RoutingStrategy, provider_name: str):
+        if isinstance(active_strategy, CostLatencyTradeoffStrategy):
+            active_strategy.update_metrics(provider_name, is_error=False)
 
-    def _record_error(self, provider_name: str):
-        if isinstance(self.strategy, CostLatencyTradeoffStrategy):
-            self.strategy.update_metrics(provider_name, is_error=True)
+    def _record_error(self, active_strategy: RoutingStrategy, provider_name: str):
+        if isinstance(active_strategy, CostLatencyTradeoffStrategy):
+            active_strategy.update_metrics(provider_name, is_error=True)
 
     # ------------------------------------------------------------------
     # Main entry point
@@ -188,6 +186,7 @@ class RouterManager:
         messages: List[dict],
         preference: Optional[str] = None,
         fallback_models: Optional[List[str]] = None,
+        strategy_type: Optional[str] = None,
     ) -> AsyncGenerator[str, None]:
         """
         Streams a response, falling back through the candidate list on failure.
@@ -199,9 +198,10 @@ class RouterManager:
         Candidate order is determined by _build_candidates():
           routing-strategy primary → explicit fallback_models → remaining providers.
         """
-        candidates = self._build_candidates(preference, fallback_models)
+        active_strategy = get_strategy(strategy_type or settings.DEFAULT_STRATEGY)
+        candidates = self._build_candidates(active_strategy, preference, fallback_models)
         logger.info(
-            f"Strategy: {type(self.strategy).__name__} | "
+            f"Strategy: {type(active_strategy).__name__} | "
             f"Candidates: {[(p.get_provider_name(), m) for p, m in candidates]}"
         )
 
@@ -210,8 +210,8 @@ class RouterManager:
             provider_name = provider.get_provider_name()
             logger.info(f"Trying {provider_name} model={target_model or 'default'}")
 
-            if isinstance(self.strategy, LeastInFlightStrategy):
-                self.strategy.increment(provider_name)
+            if isinstance(active_strategy, LeastInFlightStrategy):
+                active_strategy.increment(provider_name)
 
             start_time = asyncio.get_running_loop().time()
             committed = False  # True once the first chunk is yielded upstream
@@ -220,11 +220,11 @@ class RouterManager:
                 async for chunk in self._stream_with_timeouts(provider, messages, target_model):
                     if not committed:
                         latency = asyncio.get_running_loop().time() - start_time
-                        self._record_latency(provider_name, latency)
+                        self._record_latency(active_strategy, provider_name, latency)
                         committed = True
                     yield chunk
 
-                self._record_success(provider_name)
+                self._record_success(active_strategy, provider_name)
                 return  # clean exit
 
             except Exception as e:
@@ -232,7 +232,7 @@ class RouterManager:
                     f"Provider {provider_name} failed "
                     f"({'committed' if committed else 'before first chunk'}): {e}"
                 )
-                self._record_error(provider_name)
+                self._record_error(active_strategy, provider_name)
                 last_error = e
 
                 if committed:
@@ -244,8 +244,8 @@ class RouterManager:
                 continue
 
             finally:
-                if isinstance(self.strategy, LeastInFlightStrategy):
-                    self.strategy.decrement(provider_name)
+                if isinstance(active_strategy, LeastInFlightStrategy):
+                    active_strategy.decrement(provider_name)
 
         if last_error:
             raise last_error

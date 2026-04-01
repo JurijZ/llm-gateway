@@ -30,7 +30,7 @@ async def test_router_manager_fallback():
     p1 = FailingProvider("failing-openai")
     p2 = WorkingProvider("working-anthropic")
     
-    manager = RouterManager([p1, p2], strategy_type="hardcoded")
+    manager = RouterManager([p1, p2])
     
     chunks = []
     async for chunk in manager.stream_with_fallback([{"role": "user", "content": "hi"}]):

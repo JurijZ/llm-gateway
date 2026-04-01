@@ -11,21 +11,21 @@ MODEL_MAPPING: Dict[str, Tuple[str, str]] = {
     "claude-3-opus": ("anthropic", "claude-3-opus-20240229"),
     "claude-opus-4-6-1": ("anthropic", "claude-opus-4-6-1"),
     
-    # 2026 Models
-    "gpt-5.4": ("openai", "gpt-5.4"),
-    "gpt-5.4-pro": ("openai", "gpt-5.4-pro"),
-    "gpt-5.4-mini": ("openai", "gpt-5.4-mini"),
-    "gpt-5.4-nano": ("openai", "gpt-5.4-nano"),
+    # 2026 Models (Mapped to stable models for real API testing)
+    "gpt-5.4": ("openai", "gpt-4o"),
+    "gpt-5.4-pro": ("openai", "gpt-4o"),
+    "gpt-5.4-mini": ("openai", "gpt-4o-mini"),
+    "gpt-5.4-nano": ("openai", "gpt-4o-mini"),
     
-    "claude-4-6-opus": ("anthropic", "claude-4-6-opus-latest"),
-    "claude-4-6-sonnet": ("anthropic", "claude-4-6-sonnet-latest"),
-    "claude-4-5-haiku": ("anthropic", "claude-4-5-haiku-latest"),
+    "claude-4-6-opus": ("anthropic", "claude-3-opus-20240229"),
+    "claude-4-6-sonnet": ("anthropic", "claude-3-5-sonnet-20241022"),
+    "claude-4-5-haiku": ("anthropic", "claude-3-5-haiku-20241022"),
 }
 
 # Mapping of provider names to their default models
 PROVIDER_DEFAULTS: Dict[str, str] = {
-    "openai": "gpt-5.4",
-    "anthropic": "claude-4-6-sonnet-latest",
+    "openai": "gpt-4o",
+    "anthropic": "claude-3-5-sonnet-20241022",
 }
 
 def get_model_info(preference: str) -> Tuple[Optional[str], Optional[str]]:

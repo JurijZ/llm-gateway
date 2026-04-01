@@ -27,17 +27,24 @@ def get_providers():
         
     return providers
 
+@lru_cache(maxsize=1)
+def get_router_manager() -> RouterManager:
+    return RouterManager(get_providers())
+
 @router.post("/chat")
-async def chat_endpoint(request: ChatRequest, providers: List = Depends(get_providers)):
-    # Initialize RouterManager with the strategy from the request (or default from manager)
-    manager = RouterManager(providers, strategy_type=request.routing_strategy)
-    
+async def chat_endpoint(
+    request: ChatRequest, 
+    manager: RouterManager = Depends(get_router_manager)
+):
     # Standardize messages to list of dicts for providers
     messages_dict = [{"role": m.role, "content": m.content} for m in request.messages]
     
     async def stream_generator():
         async for chunk in manager.stream_with_fallback(
-            messages_dict, request.model_preference, request.fallback_models
+            messages_dict, 
+            request.model_preference, 
+            request.fallback_models,
+            request.routing_strategy
         ):
             yield chunk
 

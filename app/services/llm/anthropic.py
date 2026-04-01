@@ -17,12 +17,15 @@ class AnthropicProvider(LLMProvider):
         system_msg = next((m["content"] for m in messages if m["role"] == "system"), None)
         chat_messages = [m for m in messages if m["role"] != "system"]
 
-        async with self.client.messages.stream(
-            model=model or self.default_model,
-            max_tokens=4096,
-            messages=chat_messages,
-            system=system_msg
-        ) as stream:
+        kwargs = {
+            "model": model or self.default_model,
+            "max_tokens": 4096,
+            "messages": chat_messages,
+        }
+        if system_msg:
+            kwargs["system"] = system_msg
+
+        async with self.client.messages.stream(**kwargs) as stream:
             async for text in stream.text_stream:
                 yield text
 
