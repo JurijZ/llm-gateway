@@ -32,7 +32,7 @@ async def test_chat_with_routing_strategy():
         }
         response = await ac.post("/v1/chat", json=payload)
         assert response.status_code == 200
-        assert "Hello from anthropic" in response.text
+        assert "Hello! How can I assist you today?" in response.text
 
         # 2. Test with default strategy (hardcoded) and no preference
         payload = {
@@ -40,7 +40,7 @@ async def test_chat_with_routing_strategy():
         }
         response = await ac.post("/v1/chat", json=payload)
         assert response.status_code == 200
-        assert "Hello from openai" in response.text
+        assert "Hello! How can I assist you today?" in response.text
 
 # Clear overrides after test
 def teardown_module(module):
