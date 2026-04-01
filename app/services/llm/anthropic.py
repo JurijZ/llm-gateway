@@ -1,4 +1,4 @@
-from typing import AsyncGenerator, List, Dict
+from typing import AsyncGenerator, List, Dict, Optional
 import anthropic
 from app.services.llm.base import LLMProvider
 from app.core.config import settings
@@ -8,7 +8,7 @@ class AnthropicProvider(LLMProvider):
         self.client = anthropic.AsyncAnthropic(api_key=api_key or settings.ANTHROPIC_API_KEY)
         self.default_model = default_model
 
-    async def stream_chat(self, messages: List[Dict[str, str]], model: str = None) -> AsyncGenerator[str, None]:
+    async def stream_chat(self, messages: List[Dict[str, str]], model: Optional[str] = None) -> AsyncGenerator[str, None]:
         # Convert messages from OpenAI format to Anthropic if necessary
         # OpenAI: [{"role": "user", "content": "..."}]
         # Anthropic: [{"role": "user", "content": "..."}]

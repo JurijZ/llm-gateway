@@ -8,30 +8,28 @@ from app.services.routing.strategies import (
 from app.core.config import settings
 from app.core.models import get_model_info
 import logging
+from functools import lru_cache
 
 logger = logging.getLogger(__name__)
+
+@lru_cache(maxsize=None)
+def get_strategy(strategy_name: str) -> RoutingStrategy:
+    if strategy_name == "load_balance":
+        return LeastInFlightStrategy()
+    elif strategy_name == "latency":
+        return LatencyBasedStrategy()
+    elif strategy_name == "cost_latency":
+        return CostLatencyTradeoffStrategy()
+    else:
+        return HardcodedStrategy()
 
 
 class RouterManager:
     def __init__(self, providers: List[LLMProvider], strategy_type: str = None):
         self.providers = providers
-        self.strategy: RoutingStrategy = self._get_strategy(
+        self.strategy: RoutingStrategy = get_strategy(
             strategy_type or settings.DEFAULT_STRATEGY
         )
-
-    # ------------------------------------------------------------------
-    # Strategy factory
-    # ------------------------------------------------------------------
-
-    def _get_strategy(self, strategy_name: str) -> RoutingStrategy:
-        if strategy_name == "load_balance":
-            return LeastInFlightStrategy()
-        elif strategy_name == "latency":
-            return LatencyBasedStrategy()
-        elif strategy_name == "cost_latency":
-            return CostLatencyTradeoffStrategy()
-        else:
-            return HardcodedStrategy()
 
     # ------------------------------------------------------------------
     # Provider / candidate selection

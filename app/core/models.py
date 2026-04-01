@@ -1,4 +1,4 @@
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional
 
 # Mapping of friendly model names to (provider_name, actual_model_id)
 MODEL_MAPPING: Dict[str, Tuple[str, str]] = {
@@ -16,7 +16,7 @@ PROVIDER_DEFAULTS: Dict[str, str] = {
     "anthropic": "claude-3-5-sonnet-20240620",
 }
 
-def get_model_info(preference: str) -> Tuple[str, str]:
+def get_model_info(preference: str) -> Tuple[Optional[str], Optional[str]]:
     """
     Returns (provider_name, actual_model_id) for a given preference.
     If the preference is a provider name, returns the provider and its default model.

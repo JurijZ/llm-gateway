@@ -1,9 +1,9 @@
 from abc import ABC, abstractmethod
-from typing import AsyncGenerator, List, Dict, Any
+from typing import AsyncGenerator, List, Dict, Any, Optional
 
 class LLMProvider(ABC):
     @abstractmethod
-    async def stream_chat(self, messages: List[Dict[str, str]], model: str = None) -> AsyncGenerator[str, None]:
+    async def stream_chat(self, messages: List[Dict[str, str]], model: Optional[str] = None) -> AsyncGenerator[str, None]:
         """Stream chat completions from the provider."""
         pass
 

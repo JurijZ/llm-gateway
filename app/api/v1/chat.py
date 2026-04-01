@@ -5,11 +5,13 @@ from app.services.llm.openai import OpenAIProvider
 from app.services.llm.anthropic import AnthropicProvider
 from app.services.routing.manager import RouterManager
 from app.core.config import settings
+from functools import lru_cache
 from typing import List
 
 router = APIRouter(prefix="/v1")
 
 # In-memory provider discovery
+@lru_cache(maxsize=1)
 def get_providers():
     providers = []
     if settings.OPENAI_API_KEY:
