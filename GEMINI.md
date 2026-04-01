@@ -50,7 +50,7 @@ uv run fastapi dev main.py
 ### Testing
 ```bash
 # Run tests (once implemented)
-uv run pytest
+$env:PYTHONPATH="."; uv run pytest
 ```
 
 ## Development Conventions
