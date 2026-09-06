@@ -42,3 +42,45 @@ def get_model_info(preference: str) -> Tuple[Optional[str], Optional[str]]:
         return preference, PROVIDER_DEFAULTS[preference]
     
     return None, None
+
+# Estimated blended cost per token for routing strategies
+MODEL_PRICING: Dict[str, float] = {
+    # OpenAI models
+    "gpt-4o": 0.000005,
+    "gpt-4o-mini": 0.0000003,
+    "gpt-3.5-turbo": 0.0000015,
+    "gpt-5.2": 0.000008,
+    "gpt-5.4": 0.000005,
+    "gpt-5.4-pro": 0.000010,
+    "gpt-5.4-mini": 0.0000003,
+    "gpt-5.4-nano": 0.0000001,
+    
+    # Anthropic models
+    "claude-3-haiku-20240307": 0.0000005,
+    "claude-3-haiku": 0.0000005,
+    "claude-3-5-sonnet": 0.000006,
+    "claude-3-5-sonnet-20240620": 0.000006,
+    "claude-3-5-sonnet-20241022": 0.000006,
+    "claude-3-opus-20240229": 0.000030,
+    "claude-3-opus": 0.000030,
+    "claude-opus-4-6-1": 0.000030,
+    "claude-4-6-opus": 0.000030,
+    "claude-4-6-sonnet": 0.000006,
+    "claude-4-5-haiku": 0.0000005,
+}
+
+PROVIDER_DEFAULT_COSTS: Dict[str, float] = {
+    "openai": 0.000005,
+    "anthropic": 0.000006,
+}
+
+def get_model_cost(provider: str, model: Optional[str] = None) -> float:
+    """
+    Returns estimated cost per token for a given provider and model.
+    """
+    if model and model in MODEL_PRICING:
+        return MODEL_PRICING[model]
+    if provider in PROVIDER_DEFAULT_COSTS:
+        return PROVIDER_DEFAULT_COSTS[provider]
+    return 0.001
+

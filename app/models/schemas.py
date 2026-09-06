@@ -18,3 +18,4 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     content: str
     provider: str
+    model: Optional[str] = None
