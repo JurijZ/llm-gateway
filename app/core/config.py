@@ -1,4 +1,5 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import SecretStr
 from typing import Optional
 from dotenv import load_dotenv
 import os
@@ -12,11 +13,11 @@ class Settings(BaseSettings):
     DEBUG: bool = False
     
     # LLM Provider API Keys
-    OPENAI_API_KEY: Optional[str] = None
-    ANTHROPIC_API_KEY: Optional[str] = None
+    OPENAI_API_KEY: Optional[SecretStr] = None
+    ANTHROPIC_API_KEY: Optional[SecretStr] = None
     
     # Default Routing Strategy
-    DEFAULT_STRATEGY: str = "hardcoded"  # hardcoded, load_balance, latency
+    DEFAULT_STRATEGY: str = "hardcoded"  # hardcoded, load_balance, latency, cost_latency
     
     # Timeout settings (seconds)
     # TTFC_TIMEOUT: max wait for the *first* chunk — exceeding this triggers fallback.
@@ -25,7 +26,15 @@ class Settings(BaseSettings):
     #                bytes have already been sent to the client.
     TTFC_TIMEOUT: int = 10
     CHUNK_TIMEOUT: int = 30
+
+    # Circuit Breaker settings
+    CIRCUIT_BREAKER_FAILURES: int = 5
+    CIRCUIT_BREAKER_RECOVERY_TIMEOUT: float = 30.0
+
+    # Distributed Metrics Store settings
+    REDIS_URL: Optional[str] = None
     
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 settings = Settings()
+

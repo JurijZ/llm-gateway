@@ -12,21 +12,27 @@ from functools import lru_cache
 
 logger = logging.getLogger(__name__)
 
+from app.services.routing.store import get_metrics_store
+
 @lru_cache(maxsize=None)
 def get_strategy(strategy_name: str) -> RoutingStrategy:
     if strategy_name == "load_balance":
-        return LeastInFlightStrategy()
+        return LeastInFlightStrategy(get_metrics_store())
     elif strategy_name == "latency":
-        return LatencyBasedStrategy()
+        return LatencyBasedStrategy(get_metrics_store())
     elif strategy_name == "cost_latency":
-        return CostLatencyTradeoffStrategy()
+        return CostLatencyTradeoffStrategy(store=get_metrics_store())
     else:
         return HardcodedStrategy()
 
 
+
+from app.services.routing.circuit_breaker import CircuitBreaker, get_circuit_breaker
+
 class RouterManager:
-    def __init__(self, providers: List[LLMProvider]):
+    def __init__(self, providers: List[LLMProvider], circuit_breaker: Optional[CircuitBreaker] = None):
         self.providers = providers
+        self.circuit_breaker = circuit_breaker or get_circuit_breaker()
         self.last_selected_provider: Optional[str] = None
         self.last_selected_model: Optional[str] = None
 
@@ -105,6 +111,12 @@ class RouterManager:
             if p.get_provider_name() not in providers_in_chain:
                 candidates.append((p, None))
 
+        # Reorder candidates so providers with OPEN circuits are deprioritized
+        # when healthy alternatives exist in the candidate chain.
+        candidates.sort(
+            key=lambda c: 0 if self.circuit_breaker.can_execute(c[0].get_provider_name()) else 1
+        )
+
         return candidates
 
     # ------------------------------------------------------------------
@@ -116,6 +128,8 @@ class RouterManager:
         provider: LLMProvider,
         messages: List[dict],
         model: Optional[str],
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
     ) -> AsyncGenerator[str, None]:
         """
         Wraps provider.stream_chat with two-phase streaming timeouts:
@@ -130,7 +144,22 @@ class RouterManager:
             has already committed bytes to the HTTP client, so no fallback
             is possible and the error propagates to the client.
         """
-        aiter = provider.stream_chat(messages, model=model).__aiter__()
+        kwargs = {}
+        if temperature is not None:
+            kwargs["temperature"] = temperature
+        if max_tokens is not None:
+            kwargs["max_tokens"] = max_tokens
+
+        try:
+            aiter = provider.stream_chat(
+                messages,
+                model=model,
+                **kwargs,
+            ).__aiter__()
+        except TypeError:
+            aiter = provider.stream_chat(messages, model=model).__aiter__()
+
+
         try:
             # --- Phase 1: wait for first chunk ---
             async with asyncio.timeout(settings.TTFC_TIMEOUT):
@@ -181,6 +210,8 @@ class RouterManager:
         preference: Optional[str] = None,
         fallback_models: Optional[List[str]] = None,
         strategy_type: Optional[str] = None,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
     ) -> AsyncGenerator[str, None]:
         """
         Streams a response, falling back through the candidate list on failure.
@@ -210,7 +241,9 @@ class RouterManager:
             committed = False  # True once the first chunk is yielded upstream
 
             try:
-                async for chunk in self._stream_with_timeouts(provider, messages, target_model):
+                async for chunk in self._stream_with_timeouts(
+                    provider, messages, target_model, temperature=temperature, max_tokens=max_tokens
+                ):
                     if not committed:
                         latency = asyncio.get_running_loop().time() - start_time
                         active_strategy.on_first_chunk(provider_name, latency, target_model)
@@ -220,6 +253,7 @@ class RouterManager:
                     yield chunk
 
                 active_strategy.on_request_success(provider_name, target_model)
+                self.circuit_breaker.record_success(provider_name)
                 return  # clean exit
 
             except Exception as e:
@@ -228,6 +262,7 @@ class RouterManager:
                     f"({'committed' if committed else 'before first chunk'}): {e}"
                 )
                 active_strategy.on_request_error(provider_name, e, target_model)
+                self.circuit_breaker.record_failure(provider_name)
                 last_error = e
 
                 if committed:
@@ -243,3 +278,4 @@ class RouterManager:
 
         if last_error:
             raise last_error
+
