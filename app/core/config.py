@@ -27,6 +27,9 @@ class Settings(BaseSettings):
     TTFC_TIMEOUT: int = 10
     CHUNK_TIMEOUT: int = 30
 
+    # Observability & Logging settings
+    JSON_LOGS: bool = False
+
     # Circuit Breaker settings
     CIRCUIT_BREAKER_FAILURES: int = 5
     CIRCUIT_BREAKER_RECOVERY_TIMEOUT: float = 30.0

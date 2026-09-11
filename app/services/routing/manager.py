@@ -27,7 +27,13 @@ def get_strategy(strategy_name: str) -> RoutingStrategy:
 
 
 
-from app.services.routing.circuit_breaker import CircuitBreaker, get_circuit_breaker
+from app.services.routing.circuit_breaker import (
+    CircuitBreaker,
+    CircuitState,
+    CircuitBreakerOpenError,
+    get_circuit_breaker,
+)
+from app.services.telemetry import get_telemetry
 
 class RouterManager:
     def __init__(self, providers: List[LLMProvider], circuit_breaker: Optional[CircuitBreaker] = None):
@@ -114,7 +120,7 @@ class RouterManager:
         # Reorder candidates so providers with OPEN circuits are deprioritized
         # when healthy alternatives exist in the candidate chain.
         candidates.sort(
-            key=lambda c: 0 if self.circuit_breaker.can_execute(c[0].get_provider_name()) else 1
+            key=lambda c: 0 if self.circuit_breaker.get_state(c[0].get_provider_name()) != CircuitState.OPEN else 1
         )
 
         return candidates
@@ -130,6 +136,7 @@ class RouterManager:
         model: Optional[str],
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        top_p: Optional[float] = None,
     ) -> AsyncGenerator[str, None]:
         """
         Wraps provider.stream_chat with two-phase streaming timeouts:
@@ -149,6 +156,8 @@ class RouterManager:
             kwargs["temperature"] = temperature
         if max_tokens is not None:
             kwargs["max_tokens"] = max_tokens
+        if top_p is not None:
+            kwargs["top_p"] = top_p
 
         try:
             aiter = provider.stream_chat(
@@ -212,6 +221,7 @@ class RouterManager:
         strategy_type: Optional[str] = None,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        top_p: Optional[float] = None,
     ) -> AsyncGenerator[str, None]:
         """
         Streams a response, falling back through the candidate list on failure.
@@ -231,10 +241,22 @@ class RouterManager:
         )
 
         last_error = None
-        for provider, target_model in candidates:
+        for idx, (provider, target_model) in enumerate(candidates):
             provider_name = provider.get_provider_name()
-            logger.info(f"Trying {provider_name} model={target_model or 'default'}")
 
+            # Fail-fast circuit breaker check:
+            # If circuit is OPEN, bypass candidate immediately without waiting for TTFC_TIMEOUT.
+            if not self.circuit_breaker.can_execute(provider_name):
+                logger.warning(
+                    f"Circuit breaker for provider '{provider_name}' is OPEN. "
+                    f"Bypassing immediately without timeout."
+                )
+                continue
+
+            if idx > 0:
+                get_telemetry().record_fallback()
+
+            logger.info(f"Trying {provider_name} model={target_model or 'default'}")
             active_strategy.on_request_start(provider_name, target_model)
 
             start_time = asyncio.get_running_loop().time()
@@ -242,11 +264,17 @@ class RouterManager:
 
             try:
                 async for chunk in self._stream_with_timeouts(
-                    provider, messages, target_model, temperature=temperature, max_tokens=max_tokens
+                    provider,
+                    messages,
+                    target_model,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    top_p=top_p,
                 ):
                     if not committed:
                         latency = asyncio.get_running_loop().time() - start_time
                         active_strategy.on_first_chunk(provider_name, latency, target_model)
+                        get_telemetry().record_ttfc(latency * 1000, provider=provider_name, model=target_model)
                         self.last_selected_provider = provider_name
                         self.last_selected_model = target_model
                         committed = True
@@ -254,6 +282,10 @@ class RouterManager:
 
                 active_strategy.on_request_success(provider_name, target_model)
                 self.circuit_breaker.record_success(provider_name)
+                duration_ms = (asyncio.get_running_loop().time() - start_time) * 1000
+                get_telemetry().record_request_complete(
+                    duration_ms, success=True, provider=provider_name, model=target_model
+                )
                 return  # clean exit
 
             except Exception as e:
@@ -278,4 +310,7 @@ class RouterManager:
 
         if last_error:
             raise last_error
+        raise CircuitBreakerOpenError(
+            "All candidate upstream providers are currently unavailable due to open circuit breakers"
+        )
 

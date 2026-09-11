@@ -21,6 +21,7 @@ class AnthropicProvider(LLMProvider):
         model: Optional[str] = None,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        top_p: Optional[float] = None,
         **kwargs,
     ) -> AsyncGenerator[str, None]:
         # Convert messages from OpenAI format to Anthropic if necessary
@@ -34,6 +35,8 @@ class AnthropicProvider(LLMProvider):
         }
         if temperature is not None:
             req_kwargs["temperature"] = temperature
+        if top_p is not None:
+            req_kwargs["top_p"] = top_p
         if system_msg:
             req_kwargs["system"] = system_msg
 

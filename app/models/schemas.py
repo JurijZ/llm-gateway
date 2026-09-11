@@ -16,6 +16,7 @@ class ChatRequest(BaseModel):
     stream: bool = True
     temperature: Optional[float] = Field(default=None, ge=0.0, le=2.0)
     max_tokens: Optional[int] = Field(default=None, ge=1, le=128_000)
+    top_p: Optional[float] = Field(default=None, ge=0.0, le=1.0)
 
 class ChatResponse(BaseModel):
     content: str

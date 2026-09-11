@@ -5,6 +5,8 @@ from app.services.llm.base import LLMProvider
 from app.services.llm.openai import OpenAIProvider
 from app.services.llm.anthropic import AnthropicProvider
 from app.services.routing.manager import RouterManager
+from app.services.routing.circuit_breaker import CircuitBreakerOpenError
+from app.services.telemetry import get_telemetry
 from app.core.config import settings
 from app.core.middleware import get_request_id
 from functools import lru_cache
@@ -52,6 +54,8 @@ async def chat_endpoint(
     # Standardize messages to list of dicts for providers
     messages_dict = [{"role": m.role, "content": m.content} for m in request.messages]
     req_id = get_request_id()
+    telemetry = get_telemetry()
+    telemetry.record_request_start()
     start_time = asyncio.get_running_loop().time()
     
     stream_iter = manager.stream_with_fallback(
@@ -61,6 +65,7 @@ async def chat_endpoint(
         request.routing_strategy,
         temperature=request.temperature,
         max_tokens=request.max_tokens,
+        top_p=request.top_p,
     ).__aiter__()
 
     # Phase 1: Pre-fetch first chunk before committing HTTP 200 headers to client
@@ -71,6 +76,10 @@ async def chat_endpoint(
         first_chunk = None
         ttfc_ms = int((asyncio.get_running_loop().time() - start_time) * 1000)
     except Exception as exc:
+        total_err_ms = int((asyncio.get_running_loop().time() - start_time) * 1000)
+        telemetry.record_request_complete(total_err_ms, success=False)
+        if isinstance(exc, CircuitBreakerOpenError) or "circuit breaker" in str(exc).lower():
+            raise HTTPException(status_code=503, detail=f"Service Unavailable: {exc}")
         if isinstance(exc, (TimeoutError, asyncio.TimeoutError)) or "timeout" in str(exc).lower():
             raise HTTPException(status_code=504, detail=f"Gateway Timeout: {exc}")
         raise HTTPException(status_code=502, detail=f"Bad Gateway: {exc}")

@@ -9,6 +9,7 @@ class LLMProvider(ABC):
         model: Optional[str] = None,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        top_p: Optional[float] = None,
         **kwargs,
     ) -> AsyncGenerator[str, None]:
         """Stream chat completions from the provider."""

@@ -11,6 +11,10 @@ class CircuitState(str, Enum):
     OPEN = "OPEN"
     HALF_OPEN = "HALF_OPEN"
 
+class CircuitBreakerOpenError(Exception):
+    """Raised when an upstream provider or candidate chain is blocked by open circuit breaker."""
+    pass
+
 class CircuitBreaker:
     """
     Circuit breaker tracking upstream provider availability.

@@ -22,6 +22,7 @@ class OpenAIProvider(LLMProvider):
         model: Optional[str] = None,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        top_p: Optional[float] = None,
         **kwargs,
     ) -> AsyncGenerator[str, None]:
         req_kwargs = {
@@ -33,6 +34,8 @@ class OpenAIProvider(LLMProvider):
             req_kwargs["temperature"] = temperature
         if max_tokens is not None:
             req_kwargs["max_output_tokens"] = max_tokens
+        if top_p is not None:
+            req_kwargs["top_p"] = top_p
 
         response_stream = await self.client.responses.create(**req_kwargs)
         async with response_stream as stream:

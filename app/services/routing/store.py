@@ -201,8 +201,11 @@ class RedisMetricsStore(MetricsStore):
             return self._fallback.update_error_rate(provider_name, is_error, weight_old)
         try:
             err_val = 1.0 if is_error else 0.0
-            current = self.get_error_rate(provider_name)
-            new_val = err_val if current is None else current * weight_old + err_val * (1.0 - weight_old)
+            val = self._client.get(f"llm:error_rate:{provider_name}")
+            if val is None:
+                new_val = err_val
+            else:
+                new_val = float(val) * weight_old + err_val * (1.0 - weight_old)
             self._client.set(f"llm:error_rate:{provider_name}", new_val)
             return new_val
         except Exception:
