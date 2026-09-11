@@ -8,23 +8,33 @@ from app.services.routing.strategies import (
 from app.core.config import settings
 from app.core.models import get_model_info
 import logging
-from functools import lru_cache
 
 logger = logging.getLogger(__name__)
 
 from app.services.routing.store import get_metrics_store
 
-@lru_cache(maxsize=None)
-def get_strategy(strategy_name: str) -> RoutingStrategy:
-    if strategy_name == "load_balance":
-        return LeastInFlightStrategy(get_metrics_store())
-    elif strategy_name == "latency":
-        return LatencyBasedStrategy(get_metrics_store())
-    elif strategy_name == "cost_latency":
-        return CostLatencyTradeoffStrategy(store=get_metrics_store())
-    else:
-        return HardcodedStrategy()
+# ---------------------------------------------------------------------------
+# §3.3 — Explicit strategy registry (replaces @lru_cache which cannot be
+# invalidated in tests and is closed to extension).
+# ---------------------------------------------------------------------------
 
+_STRATEGY_REGISTRY: dict[str, RoutingStrategy] = {}
+
+
+def _init_registry() -> None:
+    store = get_metrics_store()
+    _STRATEGY_REGISTRY.update({
+        "hardcoded":    HardcodedStrategy(),
+        "load_balance": LeastInFlightStrategy(store),
+        "latency":      LatencyBasedStrategy(store),
+        "cost_latency": CostLatencyTradeoffStrategy(store=store),
+    })
+
+
+def get_strategy(strategy_name: str) -> RoutingStrategy:
+    if not _STRATEGY_REGISTRY:
+        _init_registry()
+    return _STRATEGY_REGISTRY.get(strategy_name, _STRATEGY_REGISTRY["hardcoded"])
 
 
 from app.services.routing.circuit_breaker import (
@@ -39,6 +49,11 @@ class RouterManager:
     def __init__(self, providers: List[LLMProvider], circuit_breaker: Optional[CircuitBreaker] = None):
         self.providers = providers
         self.circuit_breaker = circuit_breaker or get_circuit_breaker()
+        # §3.4: last_selected_provider / last_selected_model are set as a side-effect
+        # when the first chunk is committed. Each RouterManager instance is created
+        # per-request (see chat.py get_router_manager), so there is no cross-request
+        # race. Fields exist solely so chat.py can read provider/model for HTTP headers
+        # after stream completion.
         self.last_selected_provider: Optional[str] = None
         self.last_selected_model: Optional[str] = None
 
@@ -75,6 +90,9 @@ class RouterManager:
              The same provider may appear more than once with different models.
           3. Any remaining configured providers not yet in the chain, at their
              default model, as a last-resort safety net.
+
+        Duplicate (provider_name, model) pairs are removed after the chain is
+        assembled (§3.5) to avoid redundant retry attempts.
         """
         resolved_provider_name, resolved_model_id = (
             get_model_info(preference) if preference else (None, None)
@@ -116,6 +134,17 @@ class RouterManager:
         for p in self.providers:
             if p.get_provider_name() not in providers_in_chain:
                 candidates.append((p, None))
+
+        # §3.5: Deduplicate — remove duplicate (provider_name, model) pairs while
+        # preserving order. Duplicates arise when fallback_models repeats a model.
+        seen: set[tuple[str, Optional[str]]] = set()
+        deduped: List[Tuple[LLMProvider, Optional[str]]] = []
+        for p, m in candidates:
+            key = (p.get_provider_name(), m)
+            if key not in seen:
+                seen.add(key)
+                deduped.append((p, m))
+        candidates = deduped
 
         # Reorder candidates so providers with OPEN circuits are deprioritized
         # when healthy alternatives exist in the candidate chain.
@@ -190,9 +219,13 @@ class RouterManager:
                     except StopAsyncIteration:
                         break
         finally:
-            # Always close the underlying stream (handles cancellation / timeout).
+            # §2.3: Always close the underlying stream. Re-raise CancelledError and
+            # GeneratorExit so that cancellation propagates correctly — only swallow
+            # mundane exceptions from close().
             try:
                 await aiter.aclose()
+            except (asyncio.CancelledError, GeneratorExit):
+                raise  # let cancellation / generator teardown propagate
             except Exception:
                 pass
 
@@ -235,12 +268,22 @@ class RouterManager:
         """
         active_strategy = get_strategy(strategy_type or settings.DEFAULT_STRATEGY)
         candidates = self._build_candidates(active_strategy, preference, fallback_models)
+
+        # §4.4: Structured routing decision log — queryable as individual fields
+        # in JSON log aggregators rather than an opaque f-string.
         logger.info(
-            f"Strategy: {type(active_strategy).__name__} | "
-            f"Candidates: {[(p.get_provider_name(), m) for p, m in candidates]}"
+            "Routing decision",
+            extra={
+                "strategy": type(active_strategy).__name__,
+                "candidates": [
+                    {"provider": p.get_provider_name(), "model": m}
+                    for p, m in candidates
+                ],
+            },
         )
 
         last_error = None
+        prev_provider_name: Optional[str] = None
         for idx, (provider, target_model) in enumerate(candidates):
             provider_name = provider.get_provider_name()
 
@@ -254,9 +297,18 @@ class RouterManager:
                 continue
 
             if idx > 0:
-                get_telemetry().record_fallback()
+                # §4.3: Record structured fallback event with context for debugging.
+                get_telemetry().record_fallback(
+                    failed_provider=prev_provider_name or "unknown",
+                    reason=str(last_error) if last_error else "circuit_open",
+                    next_provider=provider_name,
+                )
 
             logger.info(f"Trying {provider_name} model={target_model or 'default'}")
+
+            # §2.2: on_request_start MUST always be paired with on_request_end in
+            # the finally block below, regardless of any exception type (timeout,
+            # RuntimeError, StopAsyncIteration, CancelledError).
             active_strategy.on_request_start(provider_name, target_model)
 
             start_time = asyncio.get_running_loop().time()
@@ -296,6 +348,7 @@ class RouterManager:
                 active_strategy.on_request_error(provider_name, e, target_model)
                 self.circuit_breaker.record_failure(provider_name)
                 last_error = e
+                prev_provider_name = provider_name
 
                 if committed:
                     # Bytes already sent — surface the error immediately.
@@ -306,6 +359,8 @@ class RouterManager:
                 continue
 
             finally:
+                # §2.2: Invariant — on_request_end MUST be called here regardless
+                # of how the try block exits (success, exception, or return).
                 active_strategy.on_request_end(provider_name, target_model)
 
         if last_error:
@@ -313,4 +368,3 @@ class RouterManager:
         raise CircuitBreakerOpenError(
             "All candidate upstream providers are currently unavailable due to open circuit breakers"
         )
-

@@ -6,6 +6,29 @@ from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# §5.1 — Lua script for atomic EMA update in Redis.
+# Performs GET + compute + SET as a single atomic Redis operation, preventing
+# two concurrent workers from both reading the same stale value and then one
+# overwriting the other's EMA result.
+#
+# KEYS[1]  = Redis key for the metric value
+# ARGV[1]  = new sample value
+# ARGV[2]  = weight_old (EMA decay factor)
+# ---------------------------------------------------------------------------
+_EMA_LUA_SCRIPT = """
+local cur = redis.call('GET', KEYS[1])
+local new_val
+if cur == false then
+    new_val = tonumber(ARGV[1])
+else
+    new_val = tonumber(cur) * tonumber(ARGV[2]) + tonumber(ARGV[1]) * (1 - tonumber(ARGV[2]))
+end
+redis.call('SET', KEYS[1], tostring(new_val))
+return tostring(new_val)
+"""
+
+
 class MetricsStore(ABC):
     """Abstract interface for storing routing metrics across requests and workers."""
 
@@ -124,19 +147,47 @@ class RedisMetricsStore(MetricsStore):
     """
     Distributed metrics store utilizing Redis for multi-worker and multi-container setups.
     Falls back gracefully to in-memory store if Redis is unavailable.
+
+    §5.1: update_latency and update_error_rate use a Lua script executed via EVAL to
+    perform GET + compute + SET atomically, preventing concurrent workers from
+    overwriting each other's EMA updates.
     """
     def __init__(self, redis_url: str):
         self._fallback = InMemoryMetricsStore()
         self.redis_url = redis_url
         self._client = None
+        self._ema_script_sha: Optional[str] = None
         try:
             import redis
             self._client = redis.Redis.from_url(redis_url, decode_responses=True)
             self._client.ping()
+            # Pre-load the Lua script into Redis script cache for efficiency.
+            self._ema_script_sha = self._client.script_load(_EMA_LUA_SCRIPT)
             logger.info(f"Connected to Redis at {redis_url}")
         except Exception as e:
             logger.warning(f"Failed to connect to Redis ({e}). Falling back to InMemoryMetricsStore.")
             self._client = None
+
+    def _eval_ema(self, key: str, new_sample: float, weight_old: float) -> float:
+        """
+        Execute the atomic EMA Lua script. Uses EVALSHA if script is cached,
+        falls back to EVAL on cache miss.
+        """
+        args = [str(new_sample), str(weight_old)]
+        try:
+            if self._ema_script_sha:
+                result = self._client.evalsha(self._ema_script_sha, 1, key, *args)
+            else:
+                result = self._client.eval(_EMA_LUA_SCRIPT, 1, key, *args)
+            return float(result)
+        except Exception:
+            # On script cache miss (e.g. after Redis restart), reload and retry once.
+            try:
+                self._ema_script_sha = self._client.script_load(_EMA_LUA_SCRIPT)
+                result = self._client.evalsha(self._ema_script_sha, 1, key, *args)
+                return float(result)
+            except Exception:
+                raise
 
     def get_in_flight(self, provider_name: str) -> int:
         if not self._client:
@@ -177,13 +228,11 @@ class RedisMetricsStore(MetricsStore):
             return self._fallback.get_latency(provider_name)
 
     def update_latency(self, provider_name: str, latency: float, weight_old: float = 0.7) -> float:
+        """§5.1: Atomic EMA update via Lua script — no GET/SET race condition."""
         if not self._client:
             return self._fallback.update_latency(provider_name, latency, weight_old)
         try:
-            current = self.get_latency(provider_name)
-            new_val = latency if current is None else current * weight_old + latency * (1.0 - weight_old)
-            self._client.set(f"llm:latency:{provider_name}", new_val)
-            return new_val
+            return self._eval_ema(f"llm:latency:{provider_name}", latency, weight_old)
         except Exception:
             return self._fallback.update_latency(provider_name, latency, weight_old)
 
@@ -197,17 +246,12 @@ class RedisMetricsStore(MetricsStore):
             return self._fallback.get_error_rate(provider_name)
 
     def update_error_rate(self, provider_name: str, is_error: bool, weight_old: float = 0.7) -> float:
+        """§5.1: Atomic EMA update via Lua script — no GET/SET race condition."""
         if not self._client:
             return self._fallback.update_error_rate(provider_name, is_error, weight_old)
         try:
             err_val = 1.0 if is_error else 0.0
-            val = self._client.get(f"llm:error_rate:{provider_name}")
-            if val is None:
-                new_val = err_val
-            else:
-                new_val = float(val) * weight_old + err_val * (1.0 - weight_old)
-            self._client.set(f"llm:error_rate:{provider_name}", new_val)
-            return new_val
+            return self._eval_ema(f"llm:error_rate:{provider_name}", err_val, weight_old)
         except Exception:
             return self._fallback.update_error_rate(provider_name, is_error, weight_old)
 
@@ -251,4 +295,3 @@ def get_metrics_store() -> MetricsStore:
         else:
             _default_metrics_store = InMemoryMetricsStore()
     return _default_metrics_store
-

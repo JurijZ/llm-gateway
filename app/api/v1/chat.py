@@ -35,10 +35,16 @@ def get_providers() -> List[LLMProvider]:
     if has_anthropic:
         providers.append(AnthropicProvider())
     
-    # If no keys are set, add placeholders or raise error
+    # §2.5: Fail fast when no provider API keys are configured.
+    # Silently adding unauthenticated providers wastes TTFC_TIMEOUT × N seconds
+    # before every request fails with an auth error. Raising here surfaces the
+    # misconfiguration immediately at request time.
     if not providers:
-        providers = [OpenAIProvider(), AnthropicProvider()]
-        
+        raise ValueError(
+            "No LLM provider API keys are configured. "
+            "Set OPENAI_API_KEY and/or ANTHROPIC_API_KEY in your environment."
+        )
+
     return providers
 
 def get_router_manager(
@@ -79,6 +85,9 @@ async def chat_endpoint(
         total_err_ms = int((asyncio.get_running_loop().time() - start_time) * 1000)
         telemetry.record_request_complete(total_err_ms, success=False)
         if isinstance(exc, CircuitBreakerOpenError) or "circuit breaker" in str(exc).lower():
+            raise HTTPException(status_code=503, detail=f"Service Unavailable: {exc}")
+        # §2.5: No providers configured → 503 immediately (no timeout wasted).
+        if isinstance(exc, ValueError) and "api key" in str(exc).lower():
             raise HTTPException(status_code=503, detail=f"Service Unavailable: {exc}")
         if isinstance(exc, (TimeoutError, asyncio.TimeoutError)) or "timeout" in str(exc).lower():
             raise HTTPException(status_code=504, detail=f"Gateway Timeout: {exc}")

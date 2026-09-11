@@ -1,450 +1,467 @@
-# LLM Gateway: Codebase Review & Proposed Improvements
+# LLM Gateway — Routing Service Improvements Plan
 
-## Executive Summary
-
-A comprehensive architectural and source code review of the **LLM Gateway** repository was conducted. The codebase exhibits a clean foundation, strong separation of concerns, and well-thought-out streaming timeout and fallback primitives. However, several critical bugs, architectural limitations, testing leaks, and security/observability gaps were identified.
-
-This document outlines **10 high-impact improvements** to elevate the gateway to enterprise-grade production readiness.
+> Reviewed: `app/services/routing/`, `app/services/llm/`, `app/core/`, `app/api/v1/chat.py`  
+> Date: 2026-09-12
 
 ---
 
-## Summary of Proposed Improvements
+## 1. Architecture Overview
 
-| # | Improvement | Category | Priority | Impacted Files |
-|---|---|---|---|---|
-| 1 | **Fix Dependency Injection & Test Isolation** | Bug / Testing | Critical | `app/api/v1/chat.py`, `tests/test_chat_routing_integration.py` |
-| 2 | **Implement Dual-Mode Responses (Non-Streaming & SSE)** | Features / API | High | `app/api/v1/chat.py`, `app/models/schemas.py` |
-| 3 | **Polymorphic Strategy Lifecycle Hooks (Eliminate `isinstance` checks)** | Architecture | High | `app/services/routing/manager.py`, `app/services/routing/strategies.py` |
-| 4 | **Activate Real Cost Metrics & Model-Level Pricing in Cost+Latency Strategy** | Core Logic | High | `app/core/models.py`, `app/services/routing/strategies.py`, `manager.py` |
-| 5 | **Pre-Commit Error Handling & Accurate HTTP Status Codes in Streaming** | Reliability | High | `app/api/v1/chat.py`, `app/services/routing/manager.py` |
-| 6 | **FastAPI Lifespan Management & Clean Async Client Teardown** | Resource Management | Medium | `app/main.py`, `app/services/llm/openai.py`, `anthropic.py` |
-| 7 | **End-to-End Tracing, Correlation IDs & Structured Observability** | Observability | Medium | `app/main.py`, `app/core/logging.py`, `app/services/routing/manager.py` |
-| 8 | **Pydantic Validation Hardening, Hyperparameters & `SecretStr` Config** | Security / API | Medium | `app/core/config.py`, `app/models/schemas.py` |
-| 9 | **Circuit Breaker Pattern for Upstream Outage Protection** | Resilience | Medium | `app/services/routing/strategies.py`, `manager.py` |
-| 10 | **Pluggable Multi-Worker Metrics Store (In-Memory & Redis)** | Scalability | Medium | `app/services/routing/strategies.py` |
-
----
-
-## Detailed Improvement Proposals
-
-### 1. Fix Dependency Injection & Test Isolation
-- **Files:** `app/api/v1/chat.py`, `tests/test_chat_routing_integration.py`
-- **Category:** Bug Fix / Architecture / Testing
-- **Priority:** Critical
-
-#### Problem
-In `app/api/v1/chat.py`, `get_router_manager()` invokes `get_providers()` directly as a plain function call rather than declaring it as a FastAPI dependency:
-```python
-@lru_cache(maxsize=1)
-def get_providers():
-    ...
-
-@lru_cache(maxsize=1)
-def get_router_manager() -> RouterManager:
-    return RouterManager(get_providers())  # <-- Bypasses FastAPI Depends()
 ```
-Because of this:
-1. Setting `app.dependency_overrides[get_providers] = mock_get_providers` in `tests/test_chat_routing_integration.py` **has no effect**.
-2. Running pytest triggers live HTTP requests to OpenAI and Anthropic using whatever keys reside in the environment, causing test failures (`404 NotFoundError: model: claude-3-5-sonnet-20240620`) and outbound API token consumption during local CI.
-3. `@lru_cache(maxsize=1)` on dependency functions creates rigid global singletons that cannot be cleanly reset between tests.
-4. `test_chat_routing_integration.py` contains an invalid mock assertion expecting `"Hello! How can I assist you today?"` while the mock yields `"Hello from {self.name}"`.
-
-#### Proposed Solution
-Refactor `get_router_manager` to declare `providers: List[LLMProvider] = Depends(get_providers)`. Move singleton caching to FastAPI's dependency system or application state:
-
-```python
-# app/api/v1/chat.py
-def get_providers() -> List[LLMProvider]:
-    providers = []
-    if settings.OPENAI_API_KEY:
-        providers.append(OpenAIProvider())
-    if settings.ANTHROPIC_API_KEY:
-        providers.append(AnthropicProvider())
-    if not providers:
-        providers = [OpenAIProvider(), AnthropicProvider()]
-    return providers
-
-def get_router_manager(
-    providers: List[LLMProvider] = Depends(get_providers)
-) -> RouterManager:
-    return RouterManager(providers)
+ChatRequest → chat.py (API) → RouterManager.stream_with_fallback()
+                                   │
+                    ┌──────────────┼──────────────────────┐
+                    ▼              ▼                       ▼
+             _build_candidates  get_strategy()     CircuitBreaker
+             (ordered fallback   (lru_cache,        (per-provider
+              chain)              singleton)         open/half-open)
+                    │
+                    ▼
+             _stream_with_timeouts(provider)
+               Phase 1: TTFC_TIMEOUT (10 s)
+               Phase 2: CHUNK_TIMEOUT idle (30 s)
+                    │
+                    ▼
+             strategy hooks (on_request_start / on_first_chunk / on_request_success / on_request_error / on_request_end)
+                    │
+                    ▼
+             MetricsStore (InMemory or Redis)
+             TelemetryCollector (in-memory)
 ```
 
 ---
 
-### 2. Implement Dual-Mode Responses: Non-Streaming & Server-Sent Events (SSE)
-- **Files:** `app/api/v1/chat.py`, `app/models/schemas.py`
-- **Category:** Features / API Contract
-- **Priority:** High
+## 2. Priority 1 — Correctness & Reliability
 
-#### Problem
-`ChatRequest` defines `stream: bool = True` and `ChatResponse` (`content: str`, `provider: str`) is declared in `schemas.py`, but `chat_endpoint` **completely ignores** `request.stream`. It unconditionally returns a raw `StreamingResponse(media_type="text/plain")`.
+### 2.1 Thread/async-safety of `CircuitBreaker`
 
-Furthermore:
-- Raw `text/plain` streaming offers no event boundaries, no token metadata, and no standard way to transmit finish reasons or usage metrics.
-- Clients requesting standard JSON (`"stream": false`) receive unbuffered chunked plain text instead of structured JSON.
+**File:** `circuit_breaker.py`
 
-#### Proposed Solution
-1. Support standard non-streaming responses returning `ChatResponse` when `request.stream is False`.
-2. For streaming, support Server-Sent Events (`text/event-stream`) conforming to standard LLM event framing (`data: {"chunk": "...", "provider": "..."}\n\n` followed by `data: [DONE]\n\n`), or allow the client to specify via `Accept: text/event-stream` vs `Accept: text/plain`:
+**Problem:** The `CircuitBreaker` state machine uses plain `dict` fields with no locks.
+`get_state()` reads `_states` and then _writes_ it (OPEN → HALF_OPEN transition) in a
+non-atomic way. In an async environment with concurrent coroutines the TOCTOU window
+can cause two simultaneous probes to both see HALF_OPEN and both mark `_probe_active = True`,
+defeating the single-canary-probe guarantee.
 
-```python
-@router.post("/chat", response_model=Optional[ChatResponse])
-async def chat_endpoint(
-    request: ChatRequest, 
-    manager: RouterManager = Depends(get_router_manager)
-):
-    messages_dict = [{"role": m.role, "content": m.content} for m in request.messages]
-
-    if not request.stream:
-        content_parts = []
-        last_provider = "unknown"
-        async for chunk in manager.stream_with_fallback(
-            messages_dict, request.model_preference, request.fallback_models, request.routing_strategy
-        ):
-            content_parts.append(chunk)
-        return ChatResponse(content="".join(content_parts), provider=last_provider)
-
-    async def sse_generator():
-        async for chunk in manager.stream_with_fallback(
-            messages_dict, request.model_preference, request.fallback_models, request.routing_strategy
-        ):
-            yield f"data: {json.dumps({'chunk': chunk})}\n\n"
-        yield "data: [DONE]\n\n"
-
-    return StreamingResponse(sse_generator(), media_type="text/event-stream")
-```
-
----
-
-### 3. Polymorphic Strategy Lifecycle Hooks (Eliminate `isinstance` Checks)
-- **Files:** `app/services/routing/manager.py`, `app/services/routing/strategies.py`
-- **Category:** Architecture & Clean Code
-- **Priority:** High
-
-#### Problem
-`RouterManager` in `manager.py` tightly couples to concrete strategies through repetitive `isinstance` checks:
-- Lines 41, 70: `if isinstance(active_strategy, HardcodedStrategy):`
-- Lines 213, 247: `if isinstance(active_strategy, LeastInFlightStrategy): active_strategy.increment(...) / decrement(...)`
-- Line 167: `if isinstance(active_strategy, LatencyBasedStrategy):`
-- Lines 169, 173, 177: `if isinstance(active_strategy, CostLatencyTradeoffStrategy):`
-
-This violates the **Open-Closed Principle (OCP)**. Adding or modifying any strategy requires modifying `RouterManager` in multiple locations.
-
-#### Proposed Solution
-Define explicit lifecycle hooks on the `RoutingStrategy` abstract base class with default no-op implementations:
+**Improvement:**
+- Add an `asyncio.Lock` (or `threading.Lock` for thread-safety with sync callers) around
+  the `get_state` / `can_execute` / `record_success` / `record_failure` mutating paths.
+- Alternatively, collapse `get_state()` + `can_execute()` into one atomic method that
+  evaluates and advances state in a single critical section.
 
 ```python
-# app/services/routing/strategies.py
-class RoutingStrategy(ABC):
-    @abstractmethod
-    def select_provider(self, providers: List[LLMProvider], preference: Optional[str] = None) -> LLMProvider:
-        pass
+# circuit_breaker.py
+import threading
 
-    def on_request_start(self, provider_name: str) -> None:
-        """Invoked when a candidate provider begins executing."""
-        pass
-
-    def on_request_success(self, provider_name: str, latency: float, **kwargs) -> None:
-        """Invoked upon successful response completion."""
-        pass
-
-    def on_request_error(self, provider_name: str, error: Exception, **kwargs) -> None:
-        """Invoked when a candidate provider raises an error."""
-        pass
-
-    def on_request_end(self, provider_name: str) -> None:
-        """Invoked in finally block after request lifecycle concludes."""
-        pass
-```
-
-`RouterManager` then cleanly delegates lifecycle events polymorphically:
-```python
-active_strategy.on_request_start(provider_name)
-try:
-    ...
-    active_strategy.on_request_success(provider_name, latency)
-except Exception as e:
-    active_strategy.on_request_error(provider_name, e)
-    raise
-finally:
-    active_strategy.on_request_end(provider_name)
-```
-
----
-
-### 4. Activate Real Cost Metrics & Model-Level Pricing in Cost+Latency Strategy
-- **Files:** `app/core/models.py`, `app/services/routing/strategies.py`, `app/services/routing/manager.py`
-- **Category:** Core Business Logic
-- **Priority:** High
-
-#### Problem
-In `CostLatencyTradeoffStrategy`, the scoring formula incorporates cost:
-$$\text{score} = \alpha \times \frac{1}{\text{latency}} + \beta \times \frac{1}{\text{cost}} + \gamma \times (1 - \text{error\_rate})$$
-However:
-1. `manager.py` **never calls** `update_metrics(..., cost=...)`. Therefore, `self.costs.get(name, 0.001)` is hardcoded to `0.001` for all providers. The cost component of the algorithm is effectively inert in production.
-2. Cost is fundamentally a property of the **model**, not just the provider (e.g., `gpt-4o` vs `gpt-4o-mini`, `claude-3-5-sonnet` vs `claude-3-5-haiku`).
-
-#### Proposed Solution
-1. Define a pricing registry for token costs per model in `app/core/models.py`:
-```python
-MODEL_PRICING = {
-    "gpt-4o": {"input_per_1k": 0.0025, "output_per_1k": 0.010},
-    "gpt-4o-mini": {"input_per_1k": 0.00015, "output_per_1k": 0.0006},
-    "claude-3-5-sonnet-20241022": {"input_per_1k": 0.003, "output_per_1k": 0.015},
-    "claude-3-5-haiku-20241022": {"input_per_1k": 0.0008, "output_per_1k": 0.004},
-}
-```
-2. Initialize and update `CostLatencyTradeoffStrategy` costs based on the resolved target models.
-3. Pass actual model usage/pricing into strategy metric tracking upon completion.
-
----
-
-### 5. Pre-Commit Error Handling & Accurate HTTP Status Codes in Streaming
-- **Files:** `app/api/v1/chat.py`, `app/services/routing/manager.py`
-- **Category:** Reliability & Protocol Correctness
-- **Priority:** High
-
-#### Problem
-In FastAPI/Starlette, returning `StreamingResponse(stream_generator(), ...)` sends `HTTP/1.1 200 OK` status and headers immediately before the generator executes `__anext__()`.
-
-If all candidate providers fail during Phase 1 (e.g. rate limit 429, auth failure 401, or TTFC timeout 504):
-- The client has already received `HTTP 200 OK`.
-- The connection is abruptly severed or dumps an internal server traceback into the chunk stream.
-- The client cannot react to standard HTTP status codes (`429`, `502`, `503`, `504`).
-
-#### Proposed Solution
-Resolve the first chunk (or test the initial connection) **before** instantiating `StreamingResponse`. If an error occurs before the first chunk, raise an appropriate `HTTPException`:
-
-```python
-@router.post("/chat")
-async def chat_endpoint(request: ChatRequest, manager: RouterManager = Depends(get_router_manager)):
-    messages_dict = [{"role": m.role, "content": m.content} for m in request.messages]
-    generator = manager.stream_with_fallback(...)
-    
-    # Pre-fetch the first chunk before committing HTTP 200 headers
-    try:
-        first_chunk = await generator.__anext__()
-    except StopAsyncIteration:
-        return StreamingResponse(iter([]), media_type="text/plain")
-    except AuthenticationError as e:
-        raise HTTPException(status_code=401, detail=str(e))
-    except TimeoutError:
-        raise HTTPException(status_code=504, detail="Upstream gateway timeout")
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"All upstream providers failed: {e}")
-
-    async def stream_rest():
-        yield first_chunk
-        async for chunk in generator:
-            yield chunk
-
-    return StreamingResponse(stream_rest(), media_type="text/plain")
-```
-
----
-
-### 6. FastAPI Lifespan Management & Clean Async Client Teardown
-- **Files:** `app/main.py`, `app/services/llm/openai.py`, `app/services/llm/anthropic.py`
-- **Category:** Resource Management
-- **Priority:** Medium
-
-#### Problem
-1. `AsyncOpenAI` and `AsyncAnthropic` establish underlying `httpx.AsyncClient` connection pools. The application has no shutdown hooks to close these pools, causing leaked socket descriptors and `ResourceWarning: unclosed client session` during server reloads or graceful shutdowns.
-2. In `OpenAIProvider.stream_chat`:
-```python
-stream = await self.client.responses.create(...)
-async for event in stream:
-    ...
-```
-`stream` is an `AsyncStream` that is not wrapped in `async with` or closed in a `finally` block. When a client cancels or disconnects mid-stream, the underlying HTTP stream leaks.
-
-#### Proposed Solution
-1. Add `close()` methods to `LLMProvider` and providers:
-```python
-# app/services/llm/openai.py
-async def close(self):
-    await self.client.close()
-
-async def stream_chat(self, messages, model=None):
-    response = await self.client.responses.create(...)
-    # Ensure stream resource cleanup
-    async with response as stream:
-        async for event in stream:
-            if event.type == "response.output_text.delta":
-                yield event.delta
-```
-2. Implement FastAPI lifespan context manager in `app/main.py`:
-```python
-# app/main.py
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Startup: warm up clients / connections
-    yield
-    # Shutdown: close client connection pools
-    for provider in get_providers():
-        await provider.close()
-
-app = FastAPI(title=settings.APP_NAME, lifespan=lifespan)
-```
-
----
-
-### 7. End-to-End Tracing, Correlation IDs & Structured Observability
-- **Files:** `app/main.py`, `app/core/logging.py`, `app/services/routing/manager.py`
-- **Category:** Observability
-- **Priority:** Medium
-
-#### Problem
-1. Logging currently uses standard `logging.getLogger(__name__)` with ad-hoc string formatting (`logger.info(f"Trying {provider_name}...")`).
-2. There is no correlation or request ID tracking. In concurrent multi-user environments, log messages from different requests interleave with no way to trace a single request's path through candidate evaluation, TTFC, and fallbacks.
-3. The client receives no response headers indicating which provider or model fulfilled the request, or the latency incurred.
-
-#### Proposed Solution
-1. Add a correlation ID middleware:
-   - Extract or generate `X-Request-ID`.
-   - Store in `contextvars` for automatic inclusion in all log statements.
-   - Return `X-Request-ID`, `X-LLM-Provider`, and `X-LLM-Model` in response headers.
-2. Use structured JSON logging in production.
-3. Expose gateway telemetry endpoints (`/metrics` or OpenTelemetry traces) tracking:
-   - Request counts per provider/model.
-   - Time-to-First-Chunk (TTFC) p50, p95, p99.
-   - Fallback trigger frequency.
-
----
-
-### 8. Pydantic Validation Hardening, Hyperparameters & `SecretStr` Config
-- **Files:** `app/core/config.py`, `app/models/schemas.py`
-- **Category:** Security & API Robustness
-- **Priority:** Medium
-
-#### Problem
-1. **API Keys as plain strings**: In `app/core/config.py`, `OPENAI_API_KEY: Optional[str] = None`. Printing `settings.model_dump()` or inspecting unhandled exceptions risks leaking API keys in plaintext logs.
-2. **Missing Message Validation**: `ChatRequest` accepts empty message lists `messages: []` and permits empty or arbitrary strings for `role` and `content`. Passing invalid roles causes unhandled upstream provider exceptions.
-3. **Missing Generation Parameters**: `temperature`, `max_tokens`, and `top_p` are hardcoded in providers (`max_tokens: 4096` in Anthropic) rather than controllable per-request.
-
-#### Proposed Solution
-```python
-# app/core/config.py
-from pydantic import SecretStr
-
-class Settings(BaseSettings):
-    OPENAI_API_KEY: Optional[SecretStr] = None
-    ANTHROPIC_API_KEY: Optional[SecretStr] = None
-    ...
-
-# app/models/schemas.py
-from pydantic import BaseModel, Field
-from typing import Literal, List, Optional
-
-class Message(BaseModel):
-    role: Literal["system", "user", "assistant"]
-    content: str = Field(..., min_length=1, max_length=100_000)
-
-class ChatRequest(BaseModel):
-    messages: List[Message] = Field(..., min_length=1)
-    model_preference: Optional[str] = None
-    fallback_models: Optional[List[str]] = None
-    routing_strategy: Optional[Literal["hardcoded", "load_balance", "latency", "cost_latency"]] = None
-    stream: bool = True
-    temperature: Optional[float] = Field(None, ge=0.0, le=2.0)
-    max_tokens: Optional[int] = Field(None, ge=1, le=128_000)
-```
-
----
-
-### 9. Circuit Breaker Pattern for Upstream Outage Protection
-- **Files:** `app/services/routing/strategies.py`, `app/services/routing/manager.py`
-- **Category:** Resilience
-- **Priority:** Medium
-
-#### Problem
-When an upstream provider experiences a total outage:
-- Every incoming request routes to that provider first (until exponential moving averages slowly degrade or error rates reach 1.0).
-- Each request incurs the full `TTFC_TIMEOUT` (10 seconds) before falling back.
-- Under high load (e.g. 100 req/s), this creates request piling, exhausts thread/event-loop capacity, and severely degrades end-user latency.
-
-#### Proposed Solution
-Implement a **Circuit Breaker** on each provider with three states:
-- **CLOSED**: Normal operation. Consecutive failures increment a counter.
-- **OPEN**: Triggered after $N$ (e.g. 5) consecutive failures. All requests bypass this provider immediately without waiting for `TTFC_TIMEOUT`.
-- **HALF-OPEN**: After a cooldown period (e.g. 30s), allow a single canary probe request to test provider recovery.
-
-```python
 class CircuitBreaker:
-    def __init__(self, failure_threshold: int = 5, recovery_timeout: float = 30.0):
-        self.failure_threshold = failure_threshold
-        self.recovery_timeout = recovery_timeout
-        self.failure_count = 0
-        self.state = "CLOSED"
-        self.last_state_change = 0.0
+    def __init__(self, ...):
+        ...
+        self._lock = threading.Lock()
 
-    def is_available(self) -> bool:
-        now = time.time()
-        if self.state == "OPEN":
-            if now - self.last_state_change > self.recovery_timeout:
-                self.state = "HALF-OPEN"
+    def can_execute(self, provider_name: str) -> bool:
+        with self._lock:
+            state = self._get_state_unlocked(provider_name)
+            if state == CircuitState.CLOSED:
+                return True
+            if state == CircuitState.HALF_OPEN and not self._probe_active.get(provider_name, False):
+                self._probe_active[provider_name] = True
                 return True
             return False
-        return True
 ```
 
 ---
 
-### 10. Pluggable Multi-Worker Metrics Store (In-Memory & Redis)
-- **Files:** `app/services/routing/strategies.py`
-- **Category:** Scalability
-- **Priority:** Medium
+### 2.2 `LeastInFlightStrategy` — decrement invariant is fragile
 
-#### Problem
-In `LeastInFlightStrategy`, `LatencyBasedStrategy`, and `CostLatencyTradeoffStrategy`, state (`in_flight`, `latencies`, `error_rates`) is stored in standard Python dictionaries:
+**File:** `manager.py` lines 260–310, `strategies.py` lines 67–71
+
+**Problem:** `on_request_start` increments in-flight, `on_request_end` decrements (in
+`finally`). The `finally` block at line 308 does call `on_request_end`, so this path is
+technically correct — but the try/except/finally block ordering is fragile and non-obvious.
+A misread or future refactor could easily break it.
+
+**Improvement:**
+- Document the invariant explicitly: every `on_request_start` MUST be paired with
+  `on_request_end` regardless of exception type.
+- Add a unit test that verifies the in-flight counter is always zero after any failure
+  type (timeout, RuntimeError, StopAsyncIteration).
+
+---
+
+### 2.3 `_stream_with_timeouts` swallows `CancelledError` in `aclose()`
+
+**File:** `manager.py` lines 192–197
+
+**Problem:** The `aiter.aclose()` call in the `_stream_with_timeouts` finally block silently
+swallows _any_ exception from close (`except Exception: pass`). If `aclose` raises
+`asyncio.CancelledError` (a `BaseException` subclass in Python 3.8+), it escapes the bare
+`except Exception` — but earlier Python patterns and some ASGI servers route cancellation as
+an `Exception`. Worse, `GeneratorExit` during generator cleanup is also silently lost.
+
+**Improvement:**
 ```python
-self.in_flight: dict = {}
-self.latencies: dict = {}
-```
-In production deployments running multiple Uvicorn workers (`uvicorn -w 4`) or scaled across multiple Kubernetes containers:
-1. Metrics are trapped inside each worker's individual memory space.
-2. In-flight request counts are completely desynchronized between workers.
-3. Latency data remains cold and fragmented, causing suboptimal routing decisions.
-
-#### Proposed Solution
-Extract metrics storage behind a `MetricsStore` abstraction:
-- `InMemoryMetricsStore`: Default zero-dependency store for single-worker/local development.
-- `RedisMetricsStore`: Optional distributed store utilizing Redis hashes and atomic increments (`HINCRBY`, `HSET`) for multi-worker and multi-container deployments.
-
-```python
-class MetricsStore(ABC):
-    @abstractmethod
-    async def get_in_flight(self, provider: str) -> int: ...
-    @abstractmethod
-    async def incr_in_flight(self, provider: str) -> int: ...
-    @abstractmethod
-    async def decr_in_flight(self, provider: str) -> int: ...
-    @abstractmethod
-    async def get_latency(self, provider: str) -> Optional[float]: ...
-    @abstractmethod
-    async def record_latency(self, provider: str, latency: float) -> None: ...
+# manager.py _stream_with_timeouts finally block
+finally:
+    try:
+        await aiter.aclose()
+    except (GeneratorExit, asyncio.CancelledError):
+        raise   # let cancellation propagate
+    except Exception:
+        pass
 ```
 
 ---
 
-## Suggested Implementation Roadmap
+### 2.4 `select_provider` may return `None` in `CostLatencyTradeoffStrategy`
 
+**File:** `strategies.py` lines 197–199
+
+**Problem:** `select_provider` returns `None` when `providers` is empty. The return
+type annotation says `-> LLMProvider`, not `-> Optional[LLMProvider]`. The `RouterManager`
+never passes an empty list today, but this is a latent type violation that will cause a
+`NoneType` attribute error on `provider.get_provider_name()` at runtime.
+
+**Improvement:**
+- Change return type to `Optional[LLMProvider]` across the `RoutingStrategy` ABC, OR
+- Raise `ValueError("No providers available")` when `providers` is empty (preferred — fail-fast).
+- Add a guard in `RouterManager._build_candidates` asserting `self.providers` is non-empty.
+
+---
+
+### 2.5 Hardcoded fallback to unconfigured providers
+
+**File:** `chat.py` lines 38–42
+
+**Problem:** When neither API key is set, `get_providers()` silently adds both
+`OpenAIProvider()` and `AnthropicProvider()` with `key=None`. Every actual request
+will fail at the SDK level with an auth error, but only after the full TTFC timeout
+(10 s × 2 providers = 20 s). This wastes time and generates misleading logs.
+
+**Improvement:**
+- Raise a startup-time `ValueError` or log a `CRITICAL` warning if no providers are
+  configured, instead of returning dummy unauthenticated providers.
+- OR: return `503 Service Unavailable` immediately when all provider keys are missing.
+
+---
+
+## 3. Priority 2 — Design & Maintainability
+
+### 3.1 Proxy objects in `strategies.py` are over-engineered
+
+**File:** `strategies.py` lines 46–99, 131–172
+
+**Problem:** `LeastInFlightStrategy.in_flight`, `LatencyBasedStrategy.latencies`, and
+`CostLatencyTradeoffStrategy.latencies/costs/error_rates` return nested proxy classes that
+simulate dict semantics by delegating to `MetricsStore`. These proxies:
+- Are only used in tests (they exist to support `strategy.latencies["openai"] = 0.5`).
+- Introduce hidden coupling to `InMemoryMetricsStore` internals (`hasattr(self._store, "_latencies")`).
+- Violate the `MetricsStore` abstraction by reaching into private fields.
+
+**Improvement:**
+- Remove the proxy properties entirely; expose `update_*` / `get_*` methods directly on strategies.
+- In tests, call `strategy.update_latency("openai", 0.5)` instead of `strategy.latencies["openai"] = 0.5`.
+- This removes ~80 lines of proxy boilerplate.
+
+---
+
+### 3.2 Duplicate latency-update logic between strategies
+
+**File:** `strategies.py` lines 101–116 and 174–189
+
+**Problem:** `LatencyBasedStrategy` and `CostLatencyTradeoffStrategy` both define an
+inner `LatenciesProxy` class with identical code and duplicate the EMA update delegation
+(`on_first_chunk` → `store.update_latency`).
+
+**Improvement:**
+- Extract a `_LatencyAwareStrategy(RoutingStrategy)` base class that provides the shared
+  `update_latency` / `on_first_chunk` implementation.
+- Both concrete strategies inherit from it and only override `select_provider`.
+
+---
+
+### 3.3 `get_strategy` uses `lru_cache` — hard to test and extend
+
+**File:** `manager.py` lines 17–26
+
+**Problem:** `@lru_cache(maxsize=None)` ensures strategies are singletons, which is correct
+for preserving metrics state. However:
+- There is no way to invalidate the cache in tests without monkeypatching the module.
+- Adding a new strategy requires modifying the function body (closed to extension).
+
+**Improvement:**
+Replace with an explicit registry singleton:
+
+```python
+# manager.py
+_STRATEGY_REGISTRY: dict[str, RoutingStrategy] = {}
+
+def _init_registry() -> None:
+    store = get_metrics_store()
+    _STRATEGY_REGISTRY.update({
+        "hardcoded":    HardcodedStrategy(),
+        "load_balance": LeastInFlightStrategy(store),
+        "latency":      LatencyBasedStrategy(store),
+        "cost_latency": CostLatencyTradeoffStrategy(store=store),
+    })
+
+def get_strategy(name: str) -> RoutingStrategy:
+    if not _STRATEGY_REGISTRY:
+        _init_registry()
+    return _STRATEGY_REGISTRY.get(name, _STRATEGY_REGISTRY["hardcoded"])
 ```
-Phase 1: Stabilization & Bug Fixes (Days 1-2)
- ├── Fix #1: Dependency injection and test isolation (resolves pytest failures)
- ├── Fix #5: Pre-commit error handling to prevent broken 200 HTTP responses
- └── Fix #8: Pydantic input validation and SecretStr for API keys
 
-Phase 2: API & Architecture Enhancements (Days 3-4)
- ├── Fix #2: Implement non-streaming (stream=False) and SSE streaming formats
- ├── Fix #3: Refactor strategy lifecycle hooks (eliminate isinstance smell)
- └── Fix #6: Add FastAPI lifespan for clean client connection shutdown
+---
 
-Phase 3: Routing & Enterprise Resilience (Days 5-7)
- ├── Fix #4: Activate real model-level pricing in Cost+Latency strategy
- ├── Fix #9: Implement Circuit Breaker to prevent 10s fallback penalties during outages
- ├── Fix #7: Add Request-ID correlation middleware and structured logging
- └── Fix #10: Pluggable distributed metrics store for multi-worker support
+### 3.4 `RouterManager` mutable result fields (`last_selected_provider/model`)
+
+**File:** `chat.py` lines 44–47, `manager.py` lines 42–43
+
+**Problem:** `RouterManager` stores `last_selected_provider` and `last_selected_model` as
+mutable instance fields set mid-stream. While each request gets its own manager instance
+(no race condition), the pattern is fragile: result metadata is encoded as side-effect state
+rather than as a return value, making unit testing harder.
+
+**Improvement:**
+- Return `(async_generator, metadata_future)` from `stream_with_fallback` where
+  `metadata_future` is an `asyncio.Future` resolved on first-chunk commit, OR
+- Pass a `result: dict` out-parameter that the caller can inspect after the first chunk.
+
+---
+
+### 3.5 Duplicate entries possible in fallback chain
+
+**File:** `manager.py` lines 114–126
+
+**Problem:** `fallback_models` can list the _same model_ twice. Both entries will be added
+to candidates, causing redundant retry attempts against the same provider+model pair.
+
+**Improvement:**
+Deduplicate candidates after building the chain:
+
+```python
+seen: set[tuple[str, str | None]] = set()
+deduped: list[tuple[LLMProvider, str | None]] = []
+for p, m in candidates:
+    key = (p.get_provider_name(), m)
+    if key not in seen:
+        seen.add(key)
+        deduped.append((p, m))
+candidates = deduped
 ```
 
+---
+
+### 3.6 Model pricing inconsistency with model name resolution
+
+**File:** `core/models.py`
+
+**Problem:**
+- `MODEL_MAPPING` maps friendly names → `(provider, actual_model_id)`.
+- `MODEL_PRICING` maps a mix of friendly names AND actual model IDs to costs.
+- `get_model_cost(provider, model)` looks up `model` directly in `MODEL_PRICING`.
+  Whether it finds a friendly-name entry or an actual-model-ID entry depends on
+  which layer resolved the name, creating inconsistent cost values for the same model.
+- Several entries are duplicated (e.g. `"claude-3-opus"` and `"claude-3-opus-20240229"`).
+
+**Improvement:**
+- Normalize: always resolve friendly name → actual model ID first, then look up cost
+  by actual model ID only. Remove friendly-name entries from `MODEL_PRICING`.
+- Consider loading pricing from a config file (YAML/JSON) to allow updates without code changes.
+
+---
+
+## 4. Priority 3 — Observability & Operability
+
+### 4.1 `TelemetryCollector` has unbounded memory growth
+
+**File:** `telemetry.py` lines 18–19
+
+**Problem:** `ttfc_latencies_ms` and `total_durations_ms` are plain lists that grow without
+bound. Under production load these lists consume significant memory and cause O(n log n) sort
+cost on every `get_metrics()` call (p50/p95/p99 are computed by sorting the full list).
+
+**Improvement:**
+```python
+from collections import deque
+
+self.ttfc_latencies_ms: deque[float] = deque(maxlen=10_000)
+self.total_durations_ms: deque[float] = deque(maxlen=10_000)
+```
+
+For percentile accuracy under a bounded window, T-Digest or reservoir sampling can be added.
+
+---
+
+### 4.2 No routing-health introspection endpoint
+
+**Problem:** `GET /health` returns only `{"status": "ok"}`. Operators cannot inspect:
+- Current circuit breaker state per provider.
+- Current in-flight request counts.
+- EMA latency and error rates per provider.
+
+**Improvement:**
+Expose `GET /v1/health/routing` returning:
+
+```json
+{
+  "providers": {
+    "openai":    { "circuit_state": "CLOSED",    "in_flight": 3, "ema_latency_ms": 412.5, "ema_error_rate": 0.02 },
+    "anthropic": { "circuit_state": "HALF_OPEN",  "in_flight": 0, "ema_latency_ms": 650.1, "ema_error_rate": 0.18 }
+  }
+}
+```
+
+---
+
+### 4.3 Fallback events lack structured context
+
+**File:** `manager.py` line 257
+
+**Problem:** `get_telemetry().record_fallback()` increments a bare counter. It does not
+record which provider failed, the failure reason, or which provider was tried next. This
+makes debugging fallback storms in production impossible.
+
+**Improvement:**
+- Record structured fallback events: `(timestamp, request_id, failed_provider, reason, next_provider)`.
+- Surface as a ring-buffer of recent events in the `/v1/telemetry` endpoint.
+
+---
+
+### 4.4 Strategy selection not logged as structured fields
+
+**File:** `manager.py` lines 238–241
+
+**Problem:** Candidate list is logged as an f-string. With `JSON_LOGS=True`, this is
+embedded in a string field and cannot be queried or alerted on per-provider.
+
+**Improvement:**
+```python
+logger.info(
+    "Routing decision",
+    extra={
+        "strategy": type(active_strategy).__name__,
+        "candidates": [{"provider": p.get_provider_name(), "model": m} for p, m in candidates],
+    }
+)
+```
+
+---
+
+## 5. Priority 4 — Performance
+
+### 5.1 `RedisMetricsStore.update_latency` is not atomic
+
+**File:** `store.py` lines 179–188
+
+**Problem:** `update_latency` performs GET then SET in two separate Redis commands.
+Under concurrent load from multiple workers, two workers can both read the same stale value,
+compute independent EMAs, and one will overwrite the other.
+
+**Improvement:**
+Use a Lua script to perform the EMA update atomically:
+
+```lua
+-- latency_ema.lua
+local cur = redis.call('GET', KEYS[1])
+local new_val
+if cur == false then
+    new_val = tonumber(ARGV[1])
+else
+    new_val = tonumber(cur) * tonumber(ARGV[2]) + tonumber(ARGV[1]) * (1 - tonumber(ARGV[2]))
+end
+redis.call('SET', KEYS[1], new_val)
+return tostring(new_val)
+```
+
+Apply the same pattern to `update_error_rate`.
+
+---
+
+### 5.2 `_calc_percentile` sorts the full list on every call
+
+**File:** `telemetry.py` lines 52–63, 65–106
+
+**Problem:** `get_metrics()` calls `_calc_percentile` three times for TTFC and three times
+for duration. Each call re-sorts the list. All six sorts happen while holding `_lock`,
+blocking concurrent telemetry writes.
+
+**Improvement:**
+Sort once per `get_metrics()` call and reuse:
+
+```python
+def get_metrics(self) -> Dict:
+    with self._lock:
+        sorted_ttfc = sorted(self.ttfc_latencies_ms)
+        ttfc_p50 = self._calc_percentile(sorted_ttfc, 0.50)
+        ttfc_p95 = self._calc_percentile(sorted_ttfc, 0.95)
+        ttfc_p99 = self._calc_percentile(sorted_ttfc, 0.99)
+        ...
+```
+
+---
+
+### 5.3 `LatencyBasedStrategy._rr_index` is not thread-safe
+
+**File:** `strategies.py` lines 111–114
+
+**Problem:** The round-robin index for providers with no latency history is an unprotected
+integer. In a threaded ASGI server, two concurrent requests can read the same index and
+both select the same "unknown" provider, skipping latency exploration of other providers.
+
+**Improvement:**
+```python
+import threading
+
+class LatencyBasedStrategy(RoutingStrategy):
+    def __init__(self, ...):
+        ...
+        self._rr_lock = threading.Lock()
+        self._rr_index = 0
+
+    def select_provider(self, providers, preference=None):
+        ...
+        if unknown:
+            with self._rr_lock:
+                idx = self._rr_index % len(unknown)
+                self._rr_index += 1
+            return unknown[idx]
+```
+
+---
+
+## 6. Test Coverage Gaps
+
+| Gap | Suggested Test |
+|-----|---------------|
+| CircuitBreaker concurrent probe race (§2.1) | `asyncio.gather` two `can_execute` calls on HALF_OPEN circuit; assert only one returns `True` |
+| In-flight counter invariant after any failure (§2.2) | Verify counter is 0 after TimeoutError, RuntimeError, and StopAsyncIteration |
+| `CancelledError` propagation through `aclose` (§2.3) | Cancel streaming task mid-flight; verify task fully cancelled |
+| Duplicate fallback deduplication (§3.5) | Pass `fallback_models=["gpt-4o", "gpt-4o"]`; verify provider attempted only once |
+| `RedisMetricsStore` atomic EMA (§5.1) | N concurrent writers updating latency; assert final EMA within tolerance |
+| Telemetry bounded memory (§4.1) | Insert >10,000 samples; assert list length stays bounded |
+| `_rr_index` thread safety (§5.3) | Concurrent `select_provider` calls; assert both unknown providers are explored |
+
+---
+
+## 7. Summary Table
+
+| # | Area | Severity | Effort |
+|---|------|----------|--------|
+| 2.1 | CircuitBreaker race condition | 🔴 High | Small |
+| 2.2 | In-flight decrement invariant documentation | 🟡 Medium | Tiny |
+| 2.3 | `CancelledError` swallowed in `aclose` | 🔴 High | Tiny |
+| 2.4 | `None` return from `select_provider` | 🟡 Medium | Small |
+| 2.5 | Unconfigured providers silently added | 🟡 Medium | Small |
+| 3.1 | Proxy objects over-engineering | 🟢 Low | Medium |
+| 3.2 | Duplicate latency EMA logic | 🟢 Low | Small |
+| 3.3 | `lru_cache` strategy registry | 🟢 Low | Small |
+| 3.4 | Mutable result fields on `RouterManager` | 🟢 Low | Medium |
+| 3.5 | Duplicate fallback entries | 🟡 Medium | Tiny |
+| 3.6 | Inconsistent model pricing lookup | 🟡 Medium | Small |
+| 4.1 | Unbounded telemetry lists | 🔴 High | Small |
+| 4.2 | No routing health endpoint | 🟡 Medium | Medium |
+| 4.3 | Fallback events unstructured | 🟡 Medium | Small |
+| 4.4 | Strategy selection not structured logging | 🟢 Low | Tiny |
+| 5.1 | Redis EMA update not atomic | 🔴 High | Medium |
+| 5.2 | Redundant sort in `get_metrics` | 🟢 Low | Tiny |
+| 5.3 | `_rr_index` not thread-safe | 🟡 Medium | Tiny |
