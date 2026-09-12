@@ -47,19 +47,42 @@ class LeastInFlightStrategy(RoutingStrategy):
     def __init__(self, store: Optional[MetricsStore] = None):
         self.store = store or InMemoryMetricsStore()
 
+    @property
+    def in_flight(self) -> dict:
+        class InFlightProxy(dict):
+            def __init__(self, store):
+                self._store = store
+            def get(self, key, default=0):
+                val = self._store.get_in_flight(key)
+                return val if val != 0 else default
+            def __getitem__(self, key):
+                return self._store.get_in_flight(key)
+            def __setitem__(self, key, val):
+                if hasattr(self._store, "_in_flight"):
+                    self._store._in_flight[key] = val
+        return InFlightProxy(self.store)
     def get_in_flight(self, provider_name: str) -> int:
         """Return the current in-flight request count for a provider."""
         return self.store.get_in_flight(provider_name)
 
+    def increment(self, provider_name: str):
     def on_request_start(self, provider_name: str, model: Optional[str] = None) -> None:
         self.store.increment_in_flight(provider_name)
 
+    def decrement(self, provider_name: str):
     def on_request_end(self, provider_name: str, model: Optional[str] = None) -> None:
         self.store.decrement_in_flight(provider_name)
+
+    def on_request_start(self, provider_name: str, model: Optional[str] = None) -> None:
+        self.increment(provider_name)
+
+    def on_request_end(self, provider_name: str, model: Optional[str] = None) -> None:
+        self.decrement(provider_name)
 
     def select_provider(self, providers: List[LLMProvider], preference: Optional[str] = None) -> LLMProvider:
         return min(providers, key=lambda p: self.store.get_in_flight(p.get_provider_name()))
 
+class LatencyBasedStrategy(RoutingStrategy):
 
 class _LatencyAwareStrategy(RoutingStrategy):
     """
@@ -69,7 +92,29 @@ class _LatencyAwareStrategy(RoutingStrategy):
     """
     def __init__(self, store: Optional[MetricsStore] = None):
         self.store = store or InMemoryMetricsStore()
+        self._rr_index: int = 0
 
+    @property
+    def latencies(self) -> dict:
+        class LatenciesProxy(dict):
+            def __init__(self, store):
+                self._store = store
+            def __contains__(self, key):
+                return self._store.get_latency(key) is not None
+            def __getitem__(self, key):
+                val = self._store.get_latency(key)
+                if val is None:
+                    raise KeyError(key)
+                return val
+            def get(self, key, default=None):
+                val = self._store.get_latency(key)
+                return val if val is not None else default
+            def __setitem__(self, key, val):
+                if hasattr(self._store, "_latencies"):
+                    self._store._latencies[key] = val
+        return LatenciesProxy(self.store)
+
+    def update_latency(self, provider_name: str, latency: float):
     def update_latency(self, provider_name: str, latency: float) -> None:
         """Update the EMA latency for a provider."""
         self.store.update_latency(provider_name, latency)
@@ -95,6 +140,8 @@ class LatencyBasedStrategy(_LatencyAwareStrategy):
         unknown = [p for p in providers if self.store.get_latency(p.get_provider_name()) is None]
 
         if unknown:
+            idx = self._rr_index % len(unknown)
+            self._rr_index += 1
             with self._rr_lock:
                 idx = self._rr_index % len(unknown)
                 self._rr_index += 1
@@ -102,6 +149,7 @@ class LatencyBasedStrategy(_LatencyAwareStrategy):
 
         return min(known, key=lambda p: self.store.get_latency(p.get_provider_name()))
 
+class CostLatencyTradeoffStrategy(RoutingStrategy):
 
 class CostLatencyTradeoffStrategy(_LatencyAwareStrategy):
     """
@@ -113,7 +161,52 @@ class CostLatencyTradeoffStrategy(_LatencyAwareStrategy):
         self.alpha = alpha
         self.beta = beta
         self.gamma = gamma
+        self.store = store or InMemoryMetricsStore()
         self.epsilon = 1e-9
+
+
+    @property
+    def latencies(self) -> dict:
+        class LatenciesProxy(dict):
+            def __init__(self, store):
+                self._store = store
+            def __contains__(self, key):
+                return self._store.get_latency(key) is not None
+            def __getitem__(self, key):
+                return self._store.get_latency(key)
+            def get(self, key, default=None):
+                v = self._store.get_latency(key)
+                return v if v is not None else default
+        return LatenciesProxy(self.store)
+
+    @property
+    def costs(self) -> dict:
+        class CostsProxy(dict):
+            def __init__(self, store):
+                self._store = store
+            def __contains__(self, key):
+                return self._store.get_cost(key) is not None
+            def __getitem__(self, key):
+                return self._store.get_cost(key)
+            def get(self, key, default=None):
+                v = self._store.get_cost(key)
+                return v if v is not None else default
+            def __setitem__(self, key, val):
+                self._store.set_cost(key, val)
+        return CostsProxy(self.store)
+
+    @property
+    def error_rates(self) -> dict:
+        class ErrorRatesProxy(dict):
+            def __init__(self, store):
+                self._store = store
+            def __contains__(self, key):
+                return True
+            def __getitem__(self, key):
+                return self._store.get_error_rate(key)
+            def get(self, key, default=0.0):
+                return self._store.get_error_rate(key)
+        return ErrorRatesProxy(self.store)
 
     def update_metrics(self, provider_name: str, latency: Optional[float] = None,
                        cost: Optional[float] = None, is_error: Optional[bool] = None):
@@ -149,6 +242,7 @@ class CostLatencyTradeoffStrategy(_LatencyAwareStrategy):
     def select_provider(self, providers: List[LLMProvider], preference: Optional[str] = None) -> LLMProvider:
         # §2.4: fail fast instead of silently returning None (type violation)
         if not providers:
+            return None
             raise ValueError("No providers available for CostLatencyTradeoffStrategy.select_provider")
 
         healthy = [p for p in providers if self.store.get_error_rate(p.get_provider_name()) < 1.0]
@@ -178,3 +272,4 @@ class CostLatencyTradeoffStrategy(_LatencyAwareStrategy):
                 best_provider = p
 
         return best_provider
+

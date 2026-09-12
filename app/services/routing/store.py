@@ -232,6 +232,10 @@ class RedisMetricsStore(MetricsStore):
         if not self._client:
             return self._fallback.update_latency(provider_name, latency, weight_old)
         try:
+            current = self.get_latency(provider_name)
+            new_val = latency if current is None else current * weight_old + latency * (1.0 - weight_old)
+            self._client.set(f"llm:latency:{provider_name}", new_val)
+            return new_val
             return self._eval_ema(f"llm:latency:{provider_name}", latency, weight_old)
         except Exception:
             return self._fallback.update_latency(provider_name, latency, weight_old)
@@ -251,6 +255,13 @@ class RedisMetricsStore(MetricsStore):
             return self._fallback.update_error_rate(provider_name, is_error, weight_old)
         try:
             err_val = 1.0 if is_error else 0.0
+            val = self._client.get(f"llm:error_rate:{provider_name}")
+            if val is None:
+                new_val = err_val
+            else:
+                new_val = float(val) * weight_old + err_val * (1.0 - weight_old)
+            self._client.set(f"llm:error_rate:{provider_name}", new_val)
+            return new_val
             return self._eval_ema(f"llm:error_rate:{provider_name}", err_val, weight_old)
         except Exception:
             return self._fallback.update_error_rate(provider_name, is_error, weight_old)
@@ -295,3 +306,4 @@ def get_metrics_store() -> MetricsStore:
         else:
             _default_metrics_store = InMemoryMetricsStore()
     return _default_metrics_store
+

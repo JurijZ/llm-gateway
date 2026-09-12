@@ -8,11 +8,13 @@ from app.services.routing.strategies import (
 from app.core.config import settings
 from app.core.models import get_model_info
 import logging
+from functools import lru_cache
 
 logger = logging.getLogger(__name__)
 
 from app.services.routing.store import get_metrics_store
 
+@lru_cache(maxsize=None)
 # ---------------------------------------------------------------------------
 # §3.3 — Explicit strategy registry (replaces @lru_cache which cannot be
 # invalidated in tests and is closed to extension).
@@ -32,9 +34,18 @@ def _init_registry() -> None:
 
 
 def get_strategy(strategy_name: str) -> RoutingStrategy:
+    if strategy_name == "load_balance":
+        return LeastInFlightStrategy(get_metrics_store())
+    elif strategy_name == "latency":
+        return LatencyBasedStrategy(get_metrics_store())
+    elif strategy_name == "cost_latency":
+        return CostLatencyTradeoffStrategy(store=get_metrics_store())
+    else:
+        return HardcodedStrategy()
     if not _STRATEGY_REGISTRY:
         _init_registry()
     return _STRATEGY_REGISTRY.get(strategy_name, _STRATEGY_REGISTRY["hardcoded"])
+
 
 
 from app.services.routing.circuit_breaker import (
@@ -219,6 +230,7 @@ class RouterManager:
                     except StopAsyncIteration:
                         break
         finally:
+            # Always close the underlying stream (handles cancellation / timeout).
             # §2.3: Always close the underlying stream. Re-raise CancelledError and
             # GeneratorExit so that cancellation propagates correctly — only swallow
             # mundane exceptions from close().
@@ -272,6 +284,8 @@ class RouterManager:
         # §4.4: Structured routing decision log — queryable as individual fields
         # in JSON log aggregators rather than an opaque f-string.
         logger.info(
+            f"Strategy: {type(active_strategy).__name__} | "
+            f"Candidates: {[(p.get_provider_name(), m) for p, m in candidates]}"
             "Routing decision",
             extra={
                 "strategy": type(active_strategy).__name__,
@@ -297,6 +311,7 @@ class RouterManager:
                 continue
 
             if idx > 0:
+                get_telemetry().record_fallback()
                 # §4.3: Record structured fallback event with context for debugging.
                 get_telemetry().record_fallback(
                     failed_provider=prev_provider_name or "unknown",
@@ -368,3 +383,4 @@ class RouterManager:
         raise CircuitBreakerOpenError(
             "All candidate upstream providers are currently unavailable due to open circuit breakers"
         )
+
