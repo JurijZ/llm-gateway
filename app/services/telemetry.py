@@ -1,5 +1,4 @@
 import threading
-from typing import Dict, List, Optional
 from typing import Dict, List, Optional, NamedTuple
 from collections import deque
 import math
@@ -30,8 +29,6 @@ class TelemetryCollector:
         self.fallback_triggers: int = 0
         self.provider_requests: Dict[str, int] = {}
         self.model_requests: Dict[str, int] = {}
-        self.ttfc_latencies_ms: List[float] = []
-        self.total_durations_ms: List[float] = []
         # §4.1: Use bounded deques — maxlen=10_000 caps memory at ~80 KB per list
         # and avoids O(n log n) sort cost growing unboundedly with request volume.
         self.ttfc_latencies_ms: deque[float] = deque(maxlen=10_000)
@@ -43,7 +40,6 @@ class TelemetryCollector:
         with self._lock:
             self.total_requests += 1
 
-    def record_fallback(self) -> None:
     def record_fallback(
         self,
         failed_provider: str = "unknown",
@@ -89,8 +85,6 @@ class TelemetryCollector:
             self.total_durations_ms.append(duration_ms)
 
     @staticmethod
-    def _calc_percentile(data: List[float], percentile: float) -> Optional[float]:
-        if not data:
     def _calc_percentile(sorted_data: List[float], percentile: float) -> Optional[float]:
         """
         §5.2: Expects a pre-sorted list. Callers must sort once and reuse the sorted
@@ -98,7 +92,6 @@ class TelemetryCollector:
         """
         if not sorted_data:
             return None
-        sorted_data = sorted(data)
         k = (len(sorted_data) - 1) * percentile
         f = math.floor(k)
         c = math.ceil(k)
@@ -110,9 +103,6 @@ class TelemetryCollector:
 
     def get_metrics(self) -> Dict:
         with self._lock:
-            ttfc_p50 = self._calc_percentile(self.ttfc_latencies_ms, 0.50)
-            ttfc_p95 = self._calc_percentile(self.ttfc_latencies_ms, 0.95)
-            ttfc_p99 = self._calc_percentile(self.ttfc_latencies_ms, 0.99)
             # §5.2: Sort each list exactly once, then pass the sorted result to all
             # three percentile calls. Previously _calc_percentile sorted internally,
             # causing 6 full sorts per get_metrics() call while holding _lock.
@@ -121,23 +111,16 @@ class TelemetryCollector:
             ttfc_p95 = self._calc_percentile(sorted_ttfc, 0.95)
             ttfc_p99 = self._calc_percentile(sorted_ttfc, 0.99)
             ttfc_avg = (
-                round(sum(self.ttfc_latencies_ms) / len(self.ttfc_latencies_ms), 2)
-                if self.ttfc_latencies_ms
                 round(sum(sorted_ttfc) / len(sorted_ttfc), 2)
                 if sorted_ttfc
                 else None
             )
 
-            dur_p50 = self._calc_percentile(self.total_durations_ms, 0.50)
-            dur_p95 = self._calc_percentile(self.total_durations_ms, 0.95)
-            dur_p99 = self._calc_percentile(self.total_durations_ms, 0.99)
             sorted_dur = sorted(self.total_durations_ms)
             dur_p50 = self._calc_percentile(sorted_dur, 0.50)
             dur_p95 = self._calc_percentile(sorted_dur, 0.95)
             dur_p99 = self._calc_percentile(sorted_dur, 0.99)
             dur_avg = (
-                round(sum(self.total_durations_ms) / len(self.total_durations_ms), 2)
-                if self.total_durations_ms
                 round(sum(sorted_dur) / len(sorted_dur), 2)
                 if sorted_dur
                 else None
@@ -155,7 +138,6 @@ class TelemetryCollector:
                     "p95": ttfc_p95,
                     "p99": ttfc_p99,
                     "avg": ttfc_avg,
-                    "count": len(self.ttfc_latencies_ms),
                     "count": len(sorted_ttfc),
                 },
                 "duration_ms": {
@@ -163,7 +145,6 @@ class TelemetryCollector:
                     "p95": dur_p95,
                     "p99": dur_p99,
                     "avg": dur_avg,
-                    "count": len(self.total_durations_ms),
                     "count": len(sorted_dur),
                 },
             }
@@ -203,4 +184,3 @@ def get_telemetry() -> TelemetryCollector:
     if _telemetry_singleton is None:
         _telemetry_singleton = TelemetryCollector()
     return _telemetry_singleton
-

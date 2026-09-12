@@ -1,4 +1,3 @@
-from fastapi import FastAPI
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager

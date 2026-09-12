@@ -35,14 +35,11 @@ def get_providers() -> List[LLMProvider]:
     if has_anthropic:
         providers.append(AnthropicProvider())
     
-    # If no keys are set, add placeholders or raise error
     # §2.5: Fail fast when no provider API keys are configured.
     # Silently adding unauthenticated providers wastes TTFC_TIMEOUT × N seconds
     # before every request fails with an auth error. Raising here surfaces the
     # misconfiguration immediately at request time.
     if not providers:
-        providers = [OpenAIProvider(), AnthropicProvider()]
-        
         raise ValueError(
             "No LLM provider API keys are configured. "
             "Set OPENAI_API_KEY and/or ANTHROPIC_API_KEY in your environment."
